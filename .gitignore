@@ -1,0 +1,7 @@
+.DS_Store
+__pycache__/
+.codex-tmp/
+MacTextEditor/.build/
+MacTextEditor/.cache/
+MacTextEditor/dist/
+mvbdata_20260803_2150.csv
