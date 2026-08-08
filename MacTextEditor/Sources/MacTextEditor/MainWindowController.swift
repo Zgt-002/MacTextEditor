@@ -16,7 +16,7 @@ private enum ByteQueryError: LocalizedError {
 }
 
 @MainActor
-final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearchFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
+final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearchFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, NSTabViewDelegate, NSSplitViewDelegate {
     private struct OpenedFile: @unchecked Sendable {
         let data: Data
         let encoding: EditorTextEncoding?
@@ -56,6 +56,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     private var resultQuery = ""
     private var resultOptions = SearchOptions()
     private var searchTask: Task<Void, Never>?
+    private var isReplacingAll = false
     private var activeIndex = -1
     private var untitledCounter = 1
 
@@ -65,6 +66,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     private let tabStack = NSStackView()
     private let tabScroll = NSScrollView()
     private let contentContainer = NSView()
+    private let editorResultsSplit = NSSplitView()
     private let modeControl = NSSegmentedControl(
         labels: EditorDisplayMode.allCases.map(\.title),
         trackingMode: .selectOne,
@@ -73,9 +75,30 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     )
     private let encodingPopup = NSPopUpButton()
     private let statusLabel = NSTextField(labelWithString: "准备就绪")
-    private let findBar = NSStackView()
+    private let findPanel: NSPanel = {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 250),
+            styleMask: [.titled, .closable, .resizable, .utilityWindow],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "查找"
+        panel.minSize = NSSize(width: 560, height: 250)
+        panel.isFloatingPanel = true
+        panel.becomesKeyOnlyIfNeeded = false
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        return panel
+    }()
+    private let findTabView = NSTabView()
+    private let findPanelBody = NSStackView()
     private let findField = NSSearchField()
     private let replaceField = NSTextField()
+    private let replaceLabel = NSTextField(labelWithString: "替换为：")
+    private let replaceRow = NSStackView()
+    private let findAllButton = NSButton(title: "查找全部", target: nil, action: nil)
+    private let replaceButton = NSButton(title: "替换", target: nil, action: nil)
+    private let replaceAllButton = NSButton(title: "全部替换", target: nil, action: nil)
     private let scopePopup = NSPopUpButton()
     private let caseCheckbox = NSButton(checkboxWithTitle: "区分大小写", target: nil, action: nil)
     private let wholeWordCheckbox = NSButton(checkboxWithTitle: "全词", target: nil, action: nil)
@@ -83,6 +106,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     private let findStatus = NSTextField(labelWithString: "")
     private let resultsTable = NSTableView()
     private let resultsScroll = NSScrollView()
+    private var resultsPaneHeight: CGFloat = 130
 
     init() {
         let window = NSWindow(
@@ -115,7 +139,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         let openButton = button("打开…", #selector(openDocuments))
         let saveButton = button("保存", #selector(saveDocument))
         let saveAllButton = button("全部保存", #selector(saveAllDocuments))
-        let findButton = button("查找替换", #selector(showFindBar))
+        let findButton = button("查找替换", #selector(showFindPanel))
 
         modeControl.target = self
         modeControl.action = #selector(displayModeChanged)
@@ -152,10 +176,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
             tabStack.widthAnchor.constraint(greaterThanOrEqualTo: tabScroll.contentView.widthAnchor)
         ])
 
-        contentContainer.translatesAutoresizingMaskIntoConstraints = false
-
-        configureFindBar()
+        configureFindPanel()
         configureResults()
+
+        editorResultsSplit.isVertical = false
+        editorResultsSplit.dividerStyle = .thin
+        editorResultsSplit.delegate = self
+        editorResultsSplit.addSubview(contentContainer)
 
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
@@ -175,9 +202,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
             separator(),
             tabScroll,
             separator(),
-            contentContainer,
-            findBar,
-            resultsScroll,
+            editorResultsSplit,
             separator(),
             statusRow
         ])
@@ -191,45 +216,154 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
             root.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             root.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             root.topAnchor.constraint(equalTo: content.topAnchor),
-            root.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            contentContainer.heightAnchor.constraint(greaterThanOrEqualToConstant: 260)
+            root.bottomAnchor.constraint(equalTo: content.bottomAnchor)
         ])
     }
 
-    private func configureFindBar() {
+    private func configureFindPanel() {
         findField.placeholderString = "查找"
         findField.delegate = self
         findField.cell?.usesSingleLineMode = true
         findField.cell?.isScrollable = true
         findField.cell?.lineBreakMode = .byClipping
-        findField.widthAnchor.constraint(greaterThanOrEqualToConstant: 160).isActive = true
+        findField.setContentHuggingPriority(.defaultLow, for: .horizontal)
         replaceField.placeholderString = "替换为"
         replaceField.delegate = self
         replaceField.cell?.usesSingleLineMode = true
         replaceField.cell?.isScrollable = true
         replaceField.cell?.lineBreakMode = .byClipping
-        replaceField.widthAnchor.constraint(greaterThanOrEqualToConstant: 130).isActive = true
+        replaceField.setContentHuggingPriority(.defaultLow, for: .horizontal)
         scopePopup.addItems(withTitles: ["当前文件", "所有打开文件"])
 
         let previousButton = button("上一个", #selector(findPrevious))
         let nextButton = button("下一个", #selector(findNext))
-        let allButton = button("查找全部", #selector(findAll))
-        let replaceButton = button("替换", #selector(replaceCurrent))
-        let replaceAllButton = button("全部替换", #selector(replaceAll))
+        findAllButton.target = self
+        findAllButton.action = #selector(findAll)
+        replaceButton.target = self
+        replaceButton.action = #selector(replaceCurrent)
+        replaceAllButton.target = self
+        replaceAllButton.action = #selector(replaceAll)
+        let closeButton = button("关闭", #selector(closeFindPanel))
+        closeButton.keyEquivalent = "\u{1b}"
+
+        let findLabel = NSTextField(labelWithString: "查找内容：")
+        findLabel.alignment = .right
+        findLabel.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        let findRow = NSStackView(views: [findLabel, findField])
+        findRow.orientation = .horizontal
+        findRow.alignment = .centerY
+        findRow.spacing = 8
+
+        replaceLabel.alignment = .right
+        replaceLabel.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        replaceRow.setViews([replaceLabel, replaceField], in: .leading)
+        replaceRow.orientation = .horizontal
+        replaceRow.alignment = .centerY
+        replaceRow.spacing = 8
+
+        let optionControls = NSStackView(views: [
+            caseCheckbox, wholeWordCheckbox, regexCheckbox, flexibleSpace()
+        ])
+        optionControls.orientation = .horizontal
+        optionControls.alignment = .centerY
+        optionControls.spacing = 14
+        let optionsIndent = NSView()
+        optionsIndent.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        let optionsRow = NSStackView(views: [optionsIndent, optionControls])
+        optionsRow.orientation = .horizontal
+        optionsRow.alignment = .centerY
+        optionsRow.spacing = 8
+
+        let scopeLabel = NSTextField(labelWithString: "查找范围：")
+        scopeLabel.alignment = .right
+        scopeLabel.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        let scopeRow = NSStackView(views: [
+            scopeLabel, scopePopup, flexibleSpace(),
+            previousButton, nextButton, findAllButton,
+            replaceButton, replaceAllButton
+        ])
+        scopeRow.orientation = .horizontal
+        scopeRow.alignment = .centerY
+        scopeRow.spacing = 8
 
         findStatus.textColor = .secondaryLabelColor
         findStatus.font = .systemFont(ofSize: 11)
-        findBar.setViews([
-            findField, replaceField, scopePopup,
-            caseCheckbox, wholeWordCheckbox, regexCheckbox,
-            previousButton, nextButton, allButton, replaceButton, replaceAllButton,
-            findStatus
+        findStatus.lineBreakMode = .byTruncatingTail
+        findStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let bottomRow = NSStackView(views: [findStatus, flexibleSpace(), closeButton])
+        bottomRow.orientation = .horizontal
+        bottomRow.alignment = .centerY
+        bottomRow.spacing = 8
+        findPanelBody.setViews([
+            findRow, replaceRow, optionsRow, scopeRow,
+            separator(), bottomRow
         ], in: .leading)
-        findBar.orientation = .horizontal
-        findBar.alignment = .centerY
-        findBar.spacing = 6
-        findBar.edgeInsets = NSEdgeInsets(top: 7, left: 8, bottom: 7, right: 8)
-        findBar.isHidden = true
+        findPanelBody.orientation = .vertical
+        findPanelBody.alignment = .width
+        findPanelBody.spacing = 10
+        findPanelBody.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 12, right: 14)
+
+        let findItem = NSTabViewItem(identifier: "find")
+        findItem.label = "查找"
+        findItem.view = NSView()
+        let replaceItem = NSTabViewItem(identifier: "replace")
+        replaceItem.label = "替换"
+        replaceItem.view = NSView()
+        findTabView.addTabViewItem(findItem)
+        findTabView.addTabViewItem(replaceItem)
+        findTabView.selectTabViewItem(findItem)
+        findTabView.delegate = self
+        attachFindPanelBody(to: findItem.view!)
+        updateFindPanelMode()
+
+        guard let content = findPanel.contentView else { return }
+        findPanel.delegate = self
+        findTabView.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(findTabView)
+        NSLayoutConstraint.activate([
+            findTabView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            findTabView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            findTabView.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            findTabView.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12)
+        ])
+
+        if let window {
+            let frame = window.frame
+            findPanel.setFrameOrigin(NSPoint(
+                x: frame.midX - findPanel.frame.width / 2,
+                y: frame.maxY - findPanel.frame.height - 70
+            ))
+        }
+    }
+
+    private func attachFindPanelBody(to container: NSView) {
+        findPanelBody.removeFromSuperview()
+        findPanelBody.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(findPanelBody)
+        NSLayoutConstraint.activate([
+            findPanelBody.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            findPanelBody.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            findPanelBody.topAnchor.constraint(equalTo: container.topAnchor),
+            findPanelBody.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        ])
+    }
+
+    private func updateFindPanelMode() {
+        let isReplaceMode = findTabView.indexOfTabViewItem(findTabView.selectedTabViewItem!) == 1
+        replaceLabel.alphaValue = isReplaceMode ? 1 : 0
+        replaceField.alphaValue = isReplaceMode ? 1 : 0
+        replaceField.isEnabled = isReplaceMode
+        findAllButton.isHidden = isReplaceMode
+        replaceButton.isHidden = !isReplaceMode
+        replaceAllButton.isHidden = !isReplaceMode
+        findPanel.title = isReplaceMode ? "替换" : "查找"
+    }
+
+    func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
+        guard tabView === findTabView, let container = tabViewItem?.view else { return }
+        attachFindPanelBody(to: container)
+        updateFindPanelMode()
+        findPanel.makeFirstResponder(findField)
     }
 
     func controlTextDidChange(_ notification: Notification) {
@@ -239,22 +373,95 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         findStatus.stringValue = ""
     }
 
+    func control(
+        _ control: NSControl,
+        textView: NSTextView,
+        doCommandBy commandSelector: Selector
+    ) -> Bool {
+        guard control === findField || control === replaceField else { return false }
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            findNext()
+            return true
+        }
+        return false
+    }
+
     private func configureResults() {
         resultsScroll.hasVerticalScroller = true
         resultsScroll.verticalScroller = ArrowCursorScroller(frame: .zero)
+        resultsScroll.hasHorizontalScroller = true
+        resultsScroll.horizontalScroller = ArrowCursorScroller(frame: .zero)
+        resultsScroll.autohidesScrollers = true
         resultsScroll.borderType = .bezelBorder
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("result"))
-        column.resizingMask = .autoresizingMask
+        column.width = 2_600
+        column.minWidth = 600
+        column.maxWidth = 10_000
+        column.resizingMask = .userResizingMask
         resultsTable.addTableColumn(column)
+        resultsTable.columnAutoresizingStyle = .noColumnAutoresizing
         resultsTable.headerView = nil
-        resultsTable.rowHeight = 20
+        resultsTable.rowHeight = 18
         resultsTable.intercellSpacing = NSSize(width: 0, height: 0)
         resultsTable.dataSource = self
         resultsTable.delegate = self
         resultsTable.allowsMultipleSelection = false
         resultsScroll.documentView = resultsTable
-        resultsScroll.heightAnchor.constraint(equalToConstant: 130).isActive = true
         resultsScroll.isHidden = true
+    }
+
+    private func setResultsVisible(_ visible: Bool) {
+        if visible {
+            guard resultsScroll.superview == nil else { return }
+            resultsScroll.isHidden = false
+            editorResultsSplit.addSubview(resultsScroll)
+            editorResultsSplit.setHoldingPriority(.defaultLow, forSubviewAt: 0)
+            editorResultsSplit.setHoldingPriority(.defaultHigh, forSubviewAt: 1)
+            editorResultsSplit.adjustSubviews()
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.resultsScroll.superview != nil else { return }
+                let availableHeight = max(
+                    60,
+                    self.editorResultsSplit.bounds.height
+                        - 260
+                        - self.editorResultsSplit.dividerThickness
+                )
+                let height = min(max(self.resultsPaneHeight, 60), availableHeight)
+                self.editorResultsSplit.setPosition(
+                    self.editorResultsSplit.bounds.height
+                        - height
+                        - self.editorResultsSplit.dividerThickness,
+                    ofDividerAt: 0
+                )
+            }
+        } else {
+            guard resultsScroll.superview != nil else { return }
+            resultsPaneHeight = max(resultsScroll.frame.height, 60)
+            resultsScroll.removeFromSuperview()
+            resultsScroll.isHidden = true
+            editorResultsSplit.adjustSubviews()
+        }
+    }
+
+    func splitView(
+        _ splitView: NSSplitView,
+        constrainMinCoordinate proposedMinimumPosition: CGFloat,
+        ofSubviewAt dividerIndex: Int
+    ) -> CGFloat {
+        guard splitView === editorResultsSplit else { return proposedMinimumPosition }
+        return max(proposedMinimumPosition, 260)
+    }
+
+    func splitView(
+        _ splitView: NSSplitView,
+        constrainMaxCoordinate proposedMaximumPosition: CGFloat,
+        ofSubviewAt dividerIndex: Int
+    ) -> CGFloat {
+        guard splitView === editorResultsSplit else { return proposedMaximumPosition }
+        return min(
+            proposedMaximumPosition,
+            splitView.bounds.height - 60 - splitView.dividerThickness
+        )
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
@@ -275,7 +482,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
             cell.identifier = identifier
             let field = NSTextField(labelWithString: "")
             field.translatesAutoresizingMaskIntoConstraints = false
-            field.lineBreakMode = .byTruncatingTail
+            field.lineBreakMode = .byClipping
             field.maximumNumberOfLines = 1
             cell.textField = field
             cell.addSubview(field)
@@ -886,9 +1093,28 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         )
     }
 
-    @objc func showFindBar() {
-        findBar.isHidden = false
-        window?.makeFirstResponder(findField)
+    @objc func showFindPanel() {
+        presentFindPanel(tabIndex: 0)
+    }
+
+    @objc func showReplacePanel() {
+        presentFindPanel(tabIndex: 1)
+    }
+
+    private func presentFindPanel(tabIndex: Int) {
+        findTabView.selectTabViewItem(at: tabIndex)
+        updateFindPanelMode()
+        findPanel.alphaValue = 1
+        if let window, findPanel.parent == nil {
+            window.addChildWindow(findPanel, ordered: .above)
+        }
+        findPanel.makeKeyAndOrderFront(nil)
+        findPanel.makeFirstResponder(findField)
+    }
+
+    @objc private func closeFindPanel() {
+        findPanel.orderOut(nil)
+        window?.makeKeyAndOrderFront(nil)
     }
 
     private var searchOptions: SearchOptions {
@@ -918,6 +1144,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     }
 
     private func startDirectionalFind(direction: Int) {
+        guard !isReplacingAll else { return }
         if scopePopup.indexOfSelectedItem == 0, activeDocument?.isTextLoading == true {
             findStatus.stringValue = "Text加载完成后才能查找"
             return
@@ -931,7 +1158,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         if resultQuery != query || resultOptions != options {
             searchResultItems.removeAll(keepingCapacity: true)
             resultsTable.reloadData()
-            resultsScroll.isHidden = true
+            setResultsVisible(false)
         }
         let indexes: [Int]
         if scopePopup.indexOfSelectedItem == 0 {
@@ -1282,6 +1509,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     }
 
     @objc private func findAll() {
+        guard !isReplacingAll else { return }
         if scopePopup.indexOfSelectedItem == 0, activeDocument?.isTextLoading == true {
             findStatus.stringValue = "Text加载完成后才能查找全部"
             return
@@ -1298,7 +1526,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         searchTask?.cancel()
         searchResultItems.removeAll(keepingCapacity: true)
         resultsTable.reloadData()
-        resultsScroll.isHidden = false
+        setResultsVisible(true)
         resultQuery = query
         resultOptions = options
         findStatus.stringValue = "正在分块查找…"
@@ -1410,6 +1638,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     }
 
     @objc private func replaceCurrent() {
+        guard !isReplacingAll else { return }
         guard let document = activeDocument,
               !document.isReadOnly,
               !document.isTextLoading else { return }
@@ -1458,16 +1687,29 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     }
 
     @objc private func replaceAll() {
+        guard !isReplacingAll else { return }
         let indexes = scopePopup.indexOfSelectedItem == 0
             ? [activeIndex]
             : Array(documents.indices)
         let queryText = findField.stringValue
+        guard !queryText.isEmpty else {
+            findStatus.stringValue = "请输入查找内容"
+            return
+        }
         let replacementText = replaceField.stringValue
         let options = searchOptions
         searchTask?.cancel()
-        findStatus.stringValue = "正在分块替换…"
+        isReplacingAll = true
+        replaceButton.isEnabled = false
+        replaceAllButton.isEnabled = false
+        findStatus.stringValue = "正在准备后台替换…"
         searchTask = Task { [weak self] in
             guard let self else { return }
+            defer {
+                isReplacingAll = false
+                replaceButton.isEnabled = true
+                replaceAllButton.isEnabled = true
+            }
             var total = 0
             do {
                 for index in indexes where documents.indices.contains(index) {
@@ -1477,13 +1719,61 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                           !document.isTextLoading else { continue }
                     if document.displayMode == .text {
                         guard document.hasDecodedText else { continue }
-                        let count = try editor(for: document).replaceAll(
-                            query: queryText,
-                            replacement: replacementText,
-                            options: options
-                        )
-                        total += count
-                        if count > 0 { document.isDirty = true }
+                        let documentEditor = editor(for: document)
+                        documentEditor.setEditable(false)
+                        var reloadStarted = false
+                        defer {
+                            if !reloadStarted {
+                                documentEditor.setEditable(!document.isReadOnly)
+                            }
+                        }
+                        findStatus.stringValue = "正在准备\(document.displayName)的数据…"
+                        await Task.yield()
+                        let encoding = document.encoding
+                        let source: Data
+                        if encoding == .utf8,
+                           !documentEditor.isModified,
+                           textEditorRevisions[document.id] == document.byteStore.revision {
+                            source = document.byteStore.materializedData()
+                        } else {
+                            source = documentEditor.snapshotUTF8Data()
+                        }
+                        let worker = Task.detached(priority: .userInitiated) {
+                            try SearchEngine.replacingAllUTF8(
+                                in: source,
+                                query: queryText,
+                                replacement: replacementText,
+                                options: options
+                            )
+                        }
+                        let result = try await withTaskCancellationHandler {
+                            try await worker.value
+                        } onCancel: {
+                            worker.cancel()
+                        }
+                        try Task.checkCancellation()
+                        guard result.count > 0 else { continue }
+
+                        reloadStarted = true
+                        documentEditor.beginIncrementalReplacement(editable: !document.isReadOnly)
+                        while documentEditor.documentLength > 0 {
+                            _ = documentEditor.deleteTrailingBytes(maximumLength: 4 * 1024 * 1024)
+                            findStatus.stringValue = "正在应用\(document.displayName)：已清理旧内容"
+                            await Task.yield()
+                        }
+                        var offset = 0
+                        while offset < result.data.count {
+                            let end = min(result.data.count, offset + 4 * 1024 * 1024)
+                            documentEditor.appendUTF8Data(Data(result.data[offset..<end]))
+                            offset = end
+                            let percent = result.data.isEmpty ? 100 : offset * 100 / result.data.count
+                            findStatus.stringValue = "正在应用\(document.displayName)：\(percent)%"
+                            await Task.yield()
+                        }
+                        documentEditor.finishIncrementalReplacement()
+                        total += result.count
+                        document.isDirty = true
+                        textEditorRevisions.removeValue(forKey: document.id)
                     } else {
                         let query = try byteQuery(from: queryText, mode: document.displayMode)
                         let replacement = try byteQuery(from: replacementText, mode: document.displayMode)
@@ -1520,6 +1810,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                 showActiveDocument()
                 findStatus.stringValue = "已替换\(total)项，尚未保存到磁盘"
             } catch is CancellationError {
+                findStatus.stringValue = "已取消替换"
             } catch {
                 findStatus.stringValue = error.localizedDescription
             }
@@ -1564,6 +1855,21 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         let alert = NSAlert(error: error)
         alert.messageText = title
         alert.runModal()
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        guard notification.object as? NSWindow === findPanel else { return }
+        findPanel.alphaValue = 1
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        guard notification.object as? NSWindow === findPanel else { return }
+        findPanel.alphaValue = 0.94
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard notification.object as? NSWindow === window else { return }
+        findPanel.orderOut(nil)
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {

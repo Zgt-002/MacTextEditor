@@ -25,6 +25,7 @@ struct CoreTests {
         try testGB18030RoundTrip()
         try testSearchAndReplaceChineseText()
         try testRegularExpressionCaptureReplacement()
+        try testBackgroundUTF8Replacement()
         try testBinaryFileCanBeEditedAndSaved()
         try testByteStoreChunkBoundarySearch()
         try testByteStoreRevision()
@@ -84,6 +85,26 @@ struct CoreTests {
         )
         try expect(result.count == 2, "Regular-expression replacement count failed")
         try expect(result.text == "123-abc 456-def", "Regular-expression capture replacement failed")
+    }
+
+    private static func testBackgroundUTF8Replacement() throws {
+        let exact = try SearchEngine.replacingAllUTF8(
+            in: Data("中文-123-中文".utf8),
+            query: "中文",
+            replacement: "文本",
+            options: SearchOptions(caseSensitive: true)
+        )
+        try expect(exact.count == 2, "Background UTF-8 replacement count failed")
+        try expect(String(data: exact.data, encoding: .utf8) == "文本-123-文本", "Background UTF-8 replacement failed")
+
+        let folded = try SearchEngine.replacingAllUTF8(
+            in: Data("Alpha alpha".utf8),
+            query: "alpha",
+            replacement: "x",
+            options: SearchOptions()
+        )
+        try expect(folded.count == 2, "Background case-insensitive replacement count failed")
+        try expect(String(data: folded.data, encoding: .utf8) == "x x", "Background case-insensitive replacement failed")
     }
 
     @MainActor

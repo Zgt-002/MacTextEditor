@@ -203,6 +203,14 @@ static long MTEColorValue(NSColor *color) {
     [_scintilla setEditable:NO];
 }
 
+- (void)beginIncrementalReplacementEditable:(BOOL)editable {
+    _incrementalLoadEditable = editable;
+    [_scintilla setEditable:YES];
+    [_scintilla setGeneralProperty:SCI_BEGINUNDOACTION value:0];
+    [_scintilla setGeneralProperty:SCI_GOTOPOS value:0];
+    [_scintilla setEditable:NO];
+}
+
 - (NSInteger)deleteTrailingBytesWithMaximumLength:(NSInteger)maximumLength {
     const NSInteger length = [_scintilla getGeneralProperty:SCI_GETLENGTH];
     const NSInteger deletionLength = MIN(length, MAX(0, maximumLength));
@@ -234,6 +242,25 @@ static long MTEColorValue(NSColor *color) {
     [_scintilla setGeneralProperty:SCI_SETSAVEPOINT value:0];
     [_scintilla setEditable:_incrementalLoadEditable];
     [self updateLineNumberMarginWidth];
+}
+
+- (void)finishIncrementalReplacement {
+    [_scintilla setEditable:YES];
+    [_scintilla setGeneralProperty:SCI_ENDUNDOACTION value:0];
+    [_scintilla setEditable:_incrementalLoadEditable];
+    [self updateLineNumberMarginWidth];
+}
+
+- (NSData *)UTF8Data {
+    const NSInteger length = [_scintilla getGeneralProperty:SCI_GETLENGTH];
+    if (length == 0)
+        return [NSData data];
+    NSMutableData *data = [NSMutableData dataWithLength:length + 1];
+    [_scintilla message:SCI_GETTEXT
+                 wParam:length + 1
+                 lParam:reinterpret_cast<sptr_t>(data.mutableBytes)];
+    data.length = length;
+    return data;
 }
 
 - (BOOL)isEditable {

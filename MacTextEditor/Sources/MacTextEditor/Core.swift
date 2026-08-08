@@ -286,6 +286,11 @@ struct SearchOptions: Equatable {
     var regularExpression = false
 }
 
+struct UTF8ReplacementResult: Sendable {
+    let data: Data
+    let count: Int
+}
+
 enum SearchEngine {
     static func matches(
         in text: String,
@@ -351,6 +356,69 @@ enum SearchEngine {
             output.replaceCharacters(in: range, with: replacement)
         }
         return (output as String, ranges.count)
+    }
+
+    static func replacingAllUTF8(
+        in source: Data,
+        query: String,
+        replacement: String,
+        options: SearchOptions
+    ) throws -> UTF8ReplacementResult {
+        guard !query.isEmpty else {
+            return UTF8ReplacementResult(data: source, count: 0)
+        }
+        let queryHasCase = query.unicodeScalars.contains {
+            String($0).lowercased() != String($0).uppercased()
+        }
+        if options.regularExpression || options.wholeWord || (!options.caseSensitive && queryHasCase) {
+            guard let text = String(data: source, encoding: .utf8) else {
+                throw FileCodecError.cannotDecode
+            }
+            let patternSource = options.regularExpression
+                ? query
+                : NSRegularExpression.escapedPattern(for: query)
+            let pattern = options.wholeWord
+                ? "(?<![\\p{L}\\p{N}_])(?:\(patternSource))(?![\\p{L}\\p{N}_])"
+                : patternSource
+            let regexOptions: NSRegularExpression.Options = options.caseSensitive ? [] : [.caseInsensitive]
+            let regex = try NSRegularExpression(pattern: pattern, options: regexOptions)
+            let range = NSRange(text.startIndex..., in: text)
+            let count = regex.numberOfMatches(in: text, range: range)
+            guard count > 0 else {
+                return UTF8ReplacementResult(data: source, count: 0)
+            }
+            let replaced = regex.stringByReplacingMatches(
+                in: text,
+                range: range,
+                withTemplate: replacement
+            )
+            guard let data = replaced.data(using: .utf8) else {
+                throw FileCodecError.cannotEncode(EditorTextEncoding.utf8.title)
+            }
+            return UTF8ReplacementResult(data: data, count: count)
+        }
+
+        let needle = Data(query.utf8)
+        let replacementData = Data(replacement.utf8)
+        var output = Data()
+        output.reserveCapacity(source.count)
+        var position = source.startIndex
+        var count = 0
+        while position < source.endIndex,
+              let range = source.range(of: needle, in: position..<source.endIndex) {
+            output.append(source[position..<range.lowerBound])
+            output.append(replacementData)
+            position = range.upperBound
+            count += 1
+            if count.isMultiple(of: 1_024) {
+                try Task.checkCancellation()
+            }
+        }
+        guard count > 0 else {
+            return UTF8ReplacementResult(data: source, count: 0)
+        }
+        output.append(source[position..<source.endIndex])
+        return UTF8ReplacementResult(data: output, count: count)
     }
 }
 

@@ -27,6 +27,14 @@ final class EditorTextView: NSView, @preconcurrency MTEEditorViewDelegate {
     var isModified: Bool { editorView.isModified }
     var documentLength: Int { editorView.documentLength }
 
+    func snapshotUTF8Data() -> Data {
+        editorView.utf8Data
+    }
+
+    func setEditable(_ editable: Bool) {
+        editorView.isEditable = editable
+    }
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         translatesAutoresizingMaskIntoConstraints = false
@@ -68,6 +76,11 @@ final class EditorTextView: NSView, @preconcurrency MTEEditorViewDelegate {
         editorView.beginIncrementalReload(editable: editable)
     }
 
+    func beginIncrementalReplacement(editable: Bool) {
+        isIncrementallyLoading = true
+        editorView.beginIncrementalReplacement(editable: editable)
+    }
+
     func deleteTrailingBytes(maximumLength: Int) -> Int {
         editorView.deleteTrailingBytes(maximumLength: maximumLength)
     }
@@ -78,6 +91,11 @@ final class EditorTextView: NSView, @preconcurrency MTEEditorViewDelegate {
 
     func finishIncrementalLoad() {
         editorView.finishIncrementalLoad()
+        isIncrementallyLoading = false
+    }
+
+    func finishIncrementalReplacement() {
+        editorView.finishIncrementalReplacement()
         isIncrementallyLoading = false
     }
 

@@ -45,6 +45,7 @@ typedef NS_OPTIONS(NSUInteger, MTEFindOptions) {
 @property(nonatomic, readonly) NSInteger currentColumn;
 @property(nonatomic, readonly) NSInteger documentLength;
 @property(nonatomic, copy, readonly) NSString *stringValue;
+@property(nonatomic, copy, readonly) NSData *UTF8Data;
 
 - (void)loadString:(NSString *)string
           editable:(BOOL)editable
@@ -55,10 +56,13 @@ typedef NS_OPTIONS(NSUInteger, MTEFindOptions) {
                            largeDocument:(BOOL)largeDocument;
 - (void)beginIncrementalReloadEditable:(BOOL)editable
     NS_SWIFT_NAME(beginIncrementalReload(editable:));
+- (void)beginIncrementalReplacementEditable:(BOOL)editable
+    NS_SWIFT_NAME(beginIncrementalReplacement(editable:));
 - (NSInteger)deleteTrailingBytesWithMaximumLength:(NSInteger)maximumLength
     NS_SWIFT_NAME(deleteTrailingBytes(maximumLength:));
 - (void)appendUTF8Data:(NSData *)data;
 - (void)finishIncrementalLoad;
+- (void)finishIncrementalReplacement;
 - (void)replaceSelectedTextWithString:(NSString *)replacement;
 - (NSInteger)replaceAllOccurrencesOfString:(NSString *)query
                                 withString:(NSString *)replacement

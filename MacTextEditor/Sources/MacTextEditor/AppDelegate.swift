@@ -61,7 +61,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(searchItem)
         let searchMenu = NSMenu(title: "查找")
         searchItem.submenu = searchMenu
-        searchMenu.addItem(item("查找和替换…", #selector(MainWindowController.showFindBar), "f"))
+        searchMenu.addItem(item("查找…", #selector(MainWindowController.showFindPanel), "f"))
+        searchMenu.addItem(item("替换…", #selector(MainWindowController.showReplacePanel), "h"))
     }
 
     private func item(_ title: String, _ action: Selector, _ key: String) -> NSMenuItem {
