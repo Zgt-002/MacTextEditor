@@ -20,6 +20,7 @@ final class EditorTextView: NSView, @preconcurrency MTEEditorViewDelegate {
     private(set) var isIncrementallyLoading = false
     var onTextChanged: (() -> Void)?
     var onSelectionChanged: (() -> Void)?
+    var onFilesDropped: (([URL]) -> Void)?
 
     var string: String { editorView.stringValue }
     var selectedByteRange: NSRange { editorView.selectedByteRange }
@@ -40,6 +41,9 @@ final class EditorTextView: NSView, @preconcurrency MTEEditorViewDelegate {
         translatesAutoresizingMaskIntoConstraints = false
         editorView.translatesAutoresizingMaskIntoConstraints = false
         editorView.delegate = self
+        editorView.fileDropHandler = { [weak self] urls in
+            self?.onFilesDropped?(urls)
+        }
         addSubview(editorView)
         NSLayoutConstraint.activate([
             editorView.leadingAnchor.constraint(equalTo: leadingAnchor),

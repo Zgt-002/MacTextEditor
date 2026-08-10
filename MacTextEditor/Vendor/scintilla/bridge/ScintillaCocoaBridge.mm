@@ -50,6 +50,65 @@ static long MTEColorValue(NSColor *color) {
 
 @end
 
+@interface MTEFileDropContentView : SCIContentView
+@end
+
+@interface MTEFileDropScintillaView : ScintillaView
+@property(nonatomic, copy) void (^fileDropHandler)(NSArray<NSURL *> *urls);
+@end
+
+static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
+    NSArray *objects = [sender.draggingPasteboard readObjectsForClasses:@[NSURL.class]
+                                                               options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+    NSMutableArray<NSURL *> *urls = [NSMutableArray array];
+    for (NSURL *url in objects) {
+        NSNumber *isDirectory = nil;
+        [url getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:nil];
+        if (url.isFileURL && !isDirectory.boolValue) {
+            [urls addObject:url];
+        }
+    }
+    return urls;
+}
+
+@implementation MTEFileDropScintillaView
+
++ (Class)contentViewClass {
+    return MTEFileDropContentView.class;
+}
+
+@end
+
+@implementation MTEFileDropContentView
+
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+    return MTEFileURLs(sender).count > 0 ? NSDragOperationCopy : [super draggingEntered:sender];
+}
+
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
+    return MTEFileURLs(sender).count > 0 ? NSDragOperationCopy : [super draggingUpdated:sender];
+}
+
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+    NSArray<NSURL *> *urls = MTEFileURLs(sender);
+    if (urls.count == 0) {
+        return [super performDragOperation:sender];
+    }
+
+    NSView *ancestor = self.superview;
+    while (ancestor && ![ancestor isKindOfClass:MTEFileDropScintillaView.class]) {
+        ancestor = ancestor.superview;
+    }
+    MTEFileDropScintillaView *scintilla = (MTEFileDropScintillaView *)ancestor;
+    if (!scintilla.fileDropHandler) {
+        return NO;
+    }
+    scintilla.fileDropHandler(urls);
+    return YES;
+}
+
+@end
+
 @interface MTEEditorView () <ScintillaNotificationProtocol>
 @property(nonatomic, strong) ScintillaView *scintilla;
 @property(nonatomic) NSInteger lineNumberDigits;
@@ -61,7 +120,15 @@ static long MTEColorValue(NSColor *color) {
 - (instancetype)initWithFrame:(NSRect)frameRect {
     self = [super initWithFrame:frameRect];
     if (self) {
-        _scintilla = [[ScintillaView alloc] initWithFrame:self.bounds];
+        MTEFileDropScintillaView *scintilla = [[MTEFileDropScintillaView alloc] initWithFrame:self.bounds];
+        __weak MTEEditorView *weakSelf = self;
+        scintilla.fileDropHandler = ^(NSArray<NSURL *> *urls) {
+            MTEEditorView *strongSelf = weakSelf;
+            if (strongSelf.fileDropHandler) {
+                strongSelf.fileDropHandler(urls);
+            }
+        };
+        _scintilla = scintilla;
         _scintilla.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
         _scintilla.delegate = self;
         [self addSubview:_scintilla];

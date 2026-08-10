@@ -37,6 +37,7 @@ typedef NS_OPTIONS(NSUInteger, MTEFindOptions) {
 @interface MTEEditorView : NSView
 
 @property(nonatomic, weak, nullable) id<MTEEditorViewDelegate> delegate;
+@property(nonatomic, copy, nullable) void (^fileDropHandler)(NSArray<NSURL *> *urls);
 @property(nonatomic, getter=isEditable) BOOL editable;
 @property(nonatomic, readonly, getter=isModified) BOOL modified;
 @property(nonatomic, readonly) NSRange selectedByteRange;

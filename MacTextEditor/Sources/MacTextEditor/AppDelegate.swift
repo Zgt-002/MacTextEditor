@@ -3,16 +3,25 @@ import AppKit
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var mainWindowController: MainWindowController!
+    private var pendingOpenURLs: [URL] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         mainWindowController = MainWindowController()
         mainWindowController.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
         buildMenus()
+        if !pendingOpenURLs.isEmpty {
+            mainWindowController.open(urls: pendingOpenURLs)
+            pendingOpenURLs.removeAll()
+        }
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        mainWindowController?.open(urls: urls)
+        guard let mainWindowController else {
+            pendingOpenURLs.append(contentsOf: urls)
+            return
+        }
+        mainWindowController.open(urls: urls)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

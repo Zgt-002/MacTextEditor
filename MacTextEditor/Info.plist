@@ -23,6 +23,8 @@
     <string>MacTextEditor</string>
     <key>CFBundleIdentifier</key>
     <string>local.mac-text-editor</string>
+    <key>CFBundleIconFile</key>
+    <string>MacTextEditorIcon</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
