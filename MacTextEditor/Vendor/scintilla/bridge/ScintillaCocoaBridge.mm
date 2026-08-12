@@ -6,6 +6,7 @@
 static NSString *const MTEEditorErrorDomain = @"MacTextEditor.Scintilla";
 static const int MTESearchIndicator = 8;
 static const int MTEMarkIndicator = 9;
+static const int MTESmartHighlightIndicator = 10;
 static const int MTELineNumberMargin = 0;
 static const int MTELineNumberPaddingMargin = 1;
 static const int MTESeparatorMargin = 2;
@@ -56,6 +57,7 @@ static long MTEColorValue(NSColor *color) {
 
 @interface MTEFileDropScintillaView : ScintillaView
 @property(nonatomic, copy) void (^fileDropHandler)(NSArray<NSURL *> *urls);
+@property(nonatomic, copy) BOOL (^escapeHandler)(void);
 @end
 
 static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
@@ -81,6 +83,20 @@ static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
 @end
 
 @implementation MTEFileDropContentView
+
+- (void)keyDown:(NSEvent *)event {
+    if (event.keyCode == 53) {
+        NSView *ancestor = self.superview;
+        while (ancestor && ![ancestor isKindOfClass:MTEFileDropScintillaView.class]) {
+            ancestor = ancestor.superview;
+        }
+        MTEFileDropScintillaView *scintilla = (MTEFileDropScintillaView *)ancestor;
+        if (scintilla.escapeHandler && scintilla.escapeHandler()) {
+            return;
+        }
+    }
+    [super keyDown:event];
+}
 
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
     return MTEFileURLs(sender).count > 0 ? NSDragOperationCopy : [super draggingEntered:sender];
@@ -129,6 +145,13 @@ static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
                 strongSelf.fileDropHandler(urls);
             }
         };
+        scintilla.escapeHandler = ^BOOL{
+            MTEEditorView *strongSelf = weakSelf;
+            if (strongSelf.escapeHandler) {
+                return strongSelf.escapeHandler();
+            }
+            return NO;
+        };
         _scintilla = scintilla;
         _scintilla.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
         _scintilla.delegate = self;
@@ -173,6 +196,10 @@ static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
     [_scintilla setColorProperty:SCI_INDICSETFORE parameter:MTEMarkIndicator value:NSColor.systemOrangeColor];
     [_scintilla setGeneralProperty:SCI_INDICSETALPHA parameter:MTEMarkIndicator value:105];
     [_scintilla setGeneralProperty:SCI_INDICSETUNDER parameter:MTEMarkIndicator value:1];
+    [_scintilla setGeneralProperty:SCI_INDICSETSTYLE parameter:MTESmartHighlightIndicator value:INDIC_ROUNDBOX];
+    [_scintilla setColorProperty:SCI_INDICSETFORE parameter:MTESmartHighlightIndicator value:NSColor.systemGreenColor];
+    [_scintilla setGeneralProperty:SCI_INDICSETALPHA parameter:MTESmartHighlightIndicator value:75];
+    [_scintilla setGeneralProperty:SCI_INDICSETUNDER parameter:MTESmartHighlightIndicator value:1];
     [self updateLineNumberMarginWidth];
 }
 
@@ -365,6 +392,19 @@ static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
     return _scintilla.selectedString;
 }
 
+- (NSRange)visibleByteRange {
+    const long documentLength = [_scintilla getGeneralProperty:SCI_GETLENGTH];
+    const long firstVisibleLine = [_scintilla getGeneralProperty:SCI_GETFIRSTVISIBLELINE];
+    const long linesOnScreen = MAX(1, [_scintilla getGeneralProperty:SCI_LINESONSCREEN]);
+    const long firstLine = MAX(0, firstVisibleLine - linesOnScreen * 2);
+    const long lastVisibleLine = firstVisibleLine + linesOnScreen * 3;
+    const long start = [_scintilla getGeneralProperty:SCI_POSITIONFROMLINE parameter:firstLine];
+    long end = [_scintilla getGeneralProperty:SCI_POSITIONFROMLINE parameter:lastVisibleLine + 1];
+    if (end < 0 || end > documentLength)
+        end = documentLength;
+    return NSMakeRange(start, MAX(0, end - start));
+}
+
 - (NSInteger)currentLine {
     const long position = [_scintilla getGeneralProperty:SCI_GETCURRENTPOS];
     return [_scintilla getGeneralProperty:SCI_LINEFROMPOSITION parameter:position] + 1;
@@ -532,6 +572,77 @@ static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
     return converted;
 }
 
+- (MTEEditorSearchBatch *)smartHighlightOccurrencesOfString:(NSString *)query
+                                               fromPosition:(NSInteger)fromPosition
+                                                  byteLimit:(NSInteger)byteLimit
+                                               maximumCount:(NSInteger)maximumCount
+                                                      error:(NSError **)error {
+    if (query.length == 0)
+        return [[MTEEditorSearchBatch alloc] initWithMatches:@[] nextPosition:0 finished:YES];
+
+    NSData *needle = [query dataUsingEncoding:NSUTF8StringEncoding];
+    const long documentLength = [_scintilla getGeneralProperty:SCI_GETLENGTH];
+    const long start = MIN(documentLength, MAX(0, fromPosition));
+    const long boundary = MIN(documentLength, start + MAX(1, byteLimit));
+    const long targetBoundary = MIN(documentLength, boundary + MAX(0, (long)needle.length - 1));
+    const long countLimit = MAX(1, maximumCount);
+
+    [_scintilla setGeneralProperty:SCI_SETSTATUS value:SC_STATUS_OK];
+    [_scintilla setGeneralProperty:SCI_SETSEARCHFLAGS value:SCFIND_MATCHCASE];
+    [_scintilla setGeneralProperty:SCI_SETINDICATORCURRENT value:MTESmartHighlightIndicator];
+
+    NSMutableArray<MTEEditorMatch *> *matches = [NSMutableArray array];
+    long cursor = start;
+    BOOL exhaustedRange = YES;
+    while (cursor <= targetBoundary) {
+        [_scintilla setGeneralProperty:SCI_SETTARGETRANGE parameter:cursor value:targetBoundary];
+        const long found = [_scintilla message:SCI_SEARCHINTARGET
+                                        wParam:needle.length
+                                        lParam:reinterpret_cast<sptr_t>(needle.bytes)];
+        if (found < 0)
+            break;
+        const long matchStart = [_scintilla getGeneralProperty:SCI_GETTARGETSTART];
+        const long matchEnd = [_scintilla getGeneralProperty:SCI_GETTARGETEND];
+        if (boundary < documentLength && matchStart >= boundary)
+            break;
+
+        const long matchLength = MAX(0, matchEnd - matchStart);
+        [matches addObject:[[MTEEditorMatch alloc]
+            initWithByteRange:NSMakeRange(matchStart, matchLength)
+                   lineNumber:0
+                     lineText:@""]];
+        [_scintilla setGeneralProperty:SCI_INDICATORFILLRANGE
+                             parameter:matchStart
+                                 value:matchLength];
+
+        if (matchEnd > matchStart) {
+            cursor = matchEnd;
+        } else {
+            const long next = [_scintilla getGeneralProperty:SCI_POSITIONAFTER parameter:matchStart];
+            cursor = next > matchStart ? next : matchStart + 1;
+        }
+        if (matches.count >= countLimit) {
+            exhaustedRange = NO;
+            break;
+        }
+    }
+
+    const long status = [_scintilla getGeneralProperty:SCI_GETSTATUS];
+    if (status != SC_STATUS_OK) {
+        if (error) {
+            *error = [NSError errorWithDomain:MTEEditorErrorDomain
+                                         code:status
+                                     userInfo:@{NSLocalizedDescriptionKey: @"Scintilla 智能高亮失败。"}];
+        }
+        return [[MTEEditorSearchBatch alloc] initWithMatches:@[] nextPosition:start finished:YES];
+    }
+
+    const long nextPosition = exhaustedRange ? boundary : cursor;
+    return [[MTEEditorSearchBatch alloc] initWithMatches:matches
+                                           nextPosition:nextPosition
+                                               finished:nextPosition >= documentLength];
+}
+
 - (NSInteger)replaceAllOccurrencesOfString:(NSString *)query
                                 withString:(NSString *)replacement
                                    options:(MTEFindOptions)options
@@ -600,6 +711,12 @@ static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
 - (void)clearSearchHighlights {
     const long length = [_scintilla getGeneralProperty:SCI_GETLENGTH];
     [_scintilla setGeneralProperty:SCI_SETINDICATORCURRENT value:MTESearchIndicator];
+    [_scintilla setGeneralProperty:SCI_INDICATORCLEARRANGE parameter:0 value:length];
+}
+
+- (void)clearSmartHighlights {
+    const long length = [_scintilla getGeneralProperty:SCI_GETLENGTH];
+    [_scintilla setGeneralProperty:SCI_SETINDICATORCURRENT value:MTESmartHighlightIndicator];
     [_scintilla setGeneralProperty:SCI_INDICATORCLEARRANGE parameter:0 value:length];
 }
 

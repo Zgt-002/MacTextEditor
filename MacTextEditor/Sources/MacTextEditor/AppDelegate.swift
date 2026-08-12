@@ -72,6 +72,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         searchItem.submenu = searchMenu
         searchMenu.addItem(item("查找…", #selector(MainWindowController.showFindPanel), "f"))
         searchMenu.addItem(item("替换…", #selector(MainWindowController.showReplacePanel), "h"))
+        searchMenu.addItem(.separator())
+        let smartHighlight = item(
+            "智能高亮选中内容",
+            #selector(MainWindowController.toggleSmartHighlight(_:)),
+            ""
+        )
+        smartHighlight.state = .on
+        searchMenu.addItem(smartHighlight)
     }
 
     private func item(_ title: String, _ action: Selector, _ key: String) -> NSMenuItem {

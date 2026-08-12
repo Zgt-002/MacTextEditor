@@ -121,6 +121,21 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         }
     }
 
+    private struct SmartHighlightContext: Equatable {
+        let documentID: UUID
+        let mode: EditorDisplayMode
+        let selection: NSRange
+        let revision: Int
+        let queryBytes: Data
+        let queryText: String?
+        let isSingleUnit: Bool
+    }
+
+    private struct SmartHighlightByteBatch: @unchecked Sendable {
+        let ranges: [NSRange]
+        let reachedLimit: Bool
+    }
+
     private var documents: [EditorDocument] = []
     private var editors: [UUID: EditorTextView] = [:]
     private var byteEditors: [UUID: ByteEditorView] = [:]
@@ -134,6 +149,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     private var findAllRequestID: UUID?
     private var pendingSearchResultJump: PendingSearchResultJump?
     private var replacementUndoActions: [ReplacementUndoAction] = []
+    private var smartHighlightTask: Task<Void, Never>?
+    private var smartHighlightContext: SmartHighlightContext?
+    private var suppressedSmartHighlightContext: SmartHighlightContext?
+    private var smartHighlightVisibleOnly = false
+    private var smartHighlightEnabled = true
     private var isFindingAll = false
     private var isReplacingAll = false
     private var isUndoingReplacement = false
@@ -143,6 +163,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     private let searchChunkByteCount = 4 * 1024 * 1024
     private let searchBatchMatchCount = 512
     private let maximumFindPrefillByteCount = 4 * 1024
+    private let maximumSmartHighlightByteCount = 4 * 1024
+    private let maximumSmartHighlightMatchCount = 100_000
 
     private let tabStack = NSStackView()
     private let tabScroll = NSScrollView()
@@ -526,6 +548,340 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         }
         replacementUndoActions.removeAll(keepingCapacity: false)
         updateUndoReplaceButton()
+    }
+
+    @objc func toggleSmartHighlight(_ sender: NSMenuItem) {
+        smartHighlightEnabled.toggle()
+        sender.state = smartHighlightEnabled ? .on : .off
+        if smartHighlightEnabled {
+            if let document = activeDocument {
+                scheduleSmartHighlight(for: document)
+            }
+        } else {
+            cancelSmartHighlight(clearAll: true)
+        }
+    }
+
+    private func currentSmartHighlightContext(
+        for document: EditorDocument
+    ) -> SmartHighlightContext? {
+        guard smartHighlightEnabled, !document.isTextLoading else { return nil }
+        if document.displayMode == .text {
+            guard let documentEditor = editors[document.id] else { return nil }
+            let selection = documentEditor.selectedByteRange
+            guard selection.length > 0,
+                  selection.length <= maximumSmartHighlightByteCount else { return nil }
+            let query = documentEditor.selectedString
+            guard !query.isEmpty, let queryBytes = query.data(using: .utf8) else { return nil }
+            return SmartHighlightContext(
+                documentID: document.id,
+                mode: .text,
+                selection: selection,
+                revision: documentEditor.contentRevision,
+                queryBytes: queryBytes,
+                queryText: query,
+                isSingleUnit: query.count == 1
+            )
+        }
+
+        guard let documentEditor = byteEditors[document.id] else { return nil }
+        let selection = documentEditor.selectedByteRange
+        guard selection.length > 0,
+              selection.length <= maximumSmartHighlightByteCount,
+              NSMaxRange(selection) <= document.byteStore.count else { return nil }
+        let query = document.byteStore.data(in: selection.location..<NSMaxRange(selection))
+        guard !query.isEmpty else { return nil }
+        return SmartHighlightContext(
+            documentID: document.id,
+            mode: document.displayMode,
+            selection: selection,
+            revision: document.byteStore.revision,
+            queryBytes: query,
+            queryText: nil,
+            isSingleUnit: selection.length == 1
+        )
+    }
+
+    private func scheduleSmartHighlight(for document: EditorDocument) {
+        guard let context = currentSmartHighlightContext(for: document) else {
+            smartHighlightTask?.cancel()
+            smartHighlightTask = nil
+            smartHighlightContext = nil
+            suppressedSmartHighlightContext = nil
+            smartHighlightVisibleOnly = false
+            clearSmartHighlights(for: document)
+            let selectionLength = document.displayMode == .text
+                ? editors[document.id]?.selectedByteRange.length ?? 0
+                : byteEditors[document.id]?.selectedByteRange.length ?? 0
+            if selectionLength > maximumSmartHighlightByteCount {
+                updateStatus(extra: "选中内容超过4 KB，未启动智能高亮")
+            }
+            return
+        }
+
+        if context == suppressedSmartHighlightContext { return }
+        if suppressedSmartHighlightContext != nil {
+            suppressedSmartHighlightContext = nil
+        }
+        if context == smartHighlightContext, !smartHighlightVisibleOnly { return }
+
+        let isNewSelection = context != smartHighlightContext
+        let remainsVisibleOnly = !isNewSelection && smartHighlightVisibleOnly
+        smartHighlightTask?.cancel()
+        if isNewSelection {
+            clearSmartHighlights(for: document)
+        }
+        smartHighlightContext = context
+        smartHighlightVisibleOnly = context.isSingleUnit || remainsVisibleOnly
+        smartHighlightTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(200))
+                guard let self, self.isCurrentSmartHighlight(context) else { return }
+                try await self.highlightVisibleSmartMatches(context)
+                guard !self.smartHighlightVisibleOnly else { return }
+                if context.mode == .text {
+                    try await self.highlightAllTextSmartMatches(context)
+                } else {
+                    await self.highlightAllByteSmartMatches(context)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self, self.isCurrentSmartHighlight(context) else { return }
+                self.updateStatus(extra: "智能高亮失败：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func isCurrentSmartHighlight(_ context: SmartHighlightContext) -> Bool {
+        guard smartHighlightEnabled,
+              context == smartHighlightContext,
+              activeDocument?.id == context.documentID,
+              activeDocument?.displayMode == context.mode else { return false }
+        if context.mode == .text {
+            return editors[context.documentID]?.contentRevision == context.revision
+        }
+        return activeDocument?.byteStore.revision == context.revision
+    }
+
+    private func boundedVisibleRange(
+        _ range: NSRange,
+        around selection: NSRange,
+        documentLength: Int
+    ) -> NSRange {
+        guard range.length > searchChunkByteCount else { return range }
+        let half = searchChunkByteCount / 2
+        let start = max(0, min(documentLength, selection.location) - half)
+        let end = min(documentLength, start + searchChunkByteCount)
+        return NSRange(location: start, length: max(0, end - start))
+    }
+
+    private func highlightVisibleSmartMatches(
+        _ context: SmartHighlightContext
+    ) async throws {
+        guard isCurrentSmartHighlight(context),
+              let document = activeDocument else { throw CancellationError() }
+        if context.mode == .text {
+            guard let query = context.queryText,
+                  let documentEditor = editors[context.documentID] else {
+                throw CancellationError()
+            }
+            documentEditor.clearSmartHighlights()
+            let visibleRange = boundedVisibleRange(
+                documentEditor.visibleByteRange,
+                around: context.selection,
+                documentLength: documentEditor.documentLength
+            )
+            var position = visibleRange.location
+            let end = NSMaxRange(visibleRange)
+            while position < end {
+                try Task.checkCancellation()
+                guard isCurrentSmartHighlight(context) else { throw CancellationError() }
+                let batch = try documentEditor.smartHighlightBatch(
+                    query: query,
+                    fromPosition: position,
+                    byteLimit: min(searchChunkByteCount, end - position),
+                    maximumCount: searchBatchMatchCount
+                )
+                let nextPosition = min(end, batch.nextPosition)
+                guard nextPosition > position else { break }
+                position = nextPosition
+                await Task.yield()
+            }
+            return
+        }
+
+        guard let documentEditor = byteEditors[context.documentID] else {
+            throw CancellationError()
+        }
+        let visibleRange = documentEditor.visibleByteRange
+        let ranges = byteSmartHighlightRanges(
+            in: document.byteStore.snapshot(),
+            query: context.queryBytes,
+            range: visibleRange
+        )
+        guard isCurrentSmartHighlight(context) else { throw CancellationError() }
+        documentEditor.setVisibleSmartHighlights(ranges)
+    }
+
+    private func highlightAllTextSmartMatches(
+        _ context: SmartHighlightContext
+    ) async throws {
+        guard let query = context.queryText,
+              let documentEditor = editors[context.documentID] else {
+            throw CancellationError()
+        }
+        var position = 0
+        var count = 0
+        while position < documentEditor.documentLength {
+            try Task.checkCancellation()
+            guard isCurrentSmartHighlight(context) else { throw CancellationError() }
+            let batch = try documentEditor.smartHighlightBatch(
+                query: query,
+                fromPosition: position,
+                byteLimit: searchChunkByteCount,
+                maximumCount: searchBatchMatchCount
+            )
+            count += batch.matches.count
+            if count >= maximumSmartHighlightMatchCount {
+                smartHighlightVisibleOnly = true
+                try await highlightVisibleSmartMatches(context)
+                updateStatus(extra: "匹配过多，仅高亮可见区域")
+                return
+            }
+            guard batch.nextPosition > position else { break }
+            position = batch.nextPosition
+            if batch.isFinished { break }
+            await Task.yield()
+        }
+    }
+
+    private func highlightAllByteSmartMatches(_ context: SmartHighlightContext) async {
+        guard let document = activeDocument,
+              let documentEditor = byteEditors[context.documentID] else { return }
+        documentEditor.clearFullSmartHighlights()
+        let stream = byteSmartHighlightBatches(
+            in: document.byteStore.snapshot(),
+            query: context.queryBytes
+        )
+        for await batch in stream {
+            guard isCurrentSmartHighlight(context) else { return }
+            if batch.reachedLimit {
+                smartHighlightVisibleOnly = true
+                documentEditor.clearFullSmartHighlights()
+                updateStatus(extra: "匹配过多，仅高亮可见区域")
+                return
+            }
+            documentEditor.addSmartHighlights(batch.ranges)
+            await Task.yield()
+        }
+    }
+
+    private func byteSmartHighlightRanges(
+        in snapshot: ByteStoreSnapshot,
+        query: Data,
+        range: NSRange
+    ) -> [NSRange] {
+        guard !query.isEmpty, range.length > 0 else { return [] }
+        let boundary = min(snapshot.count, NSMaxRange(range))
+        let readEnd = min(snapshot.count, boundary + query.count - 1)
+        let bytes = snapshot.data(in: range.location..<readEnd)
+        var ranges: [NSRange] = []
+        var cursor = bytes.startIndex
+        while cursor < bytes.endIndex,
+              let match = bytes.range(of: query, in: cursor..<bytes.endIndex) {
+            let location = range.location + match.lowerBound
+            if location >= boundary { break }
+            ranges.append(NSRange(location: location, length: query.count))
+            cursor = max(match.upperBound, match.lowerBound + 1)
+        }
+        return ranges
+    }
+
+    private func byteSmartHighlightBatches(
+        in snapshot: ByteStoreSnapshot,
+        query: Data
+    ) -> AsyncStream<SmartHighlightByteBatch> {
+        let chunkSize = searchChunkByteCount
+        let batchSize = searchBatchMatchCount
+        let matchLimit = maximumSmartHighlightMatchCount
+        return AsyncStream { continuation in
+            let worker = Task.detached(priority: .utility) {
+                var position = 0
+                var total = 0
+                var pending: [NSRange] = []
+                while position < snapshot.count {
+                    if Task.isCancelled {
+                        continuation.finish()
+                        return
+                    }
+                    let boundary = min(snapshot.count, position + chunkSize)
+                    let readEnd = min(snapshot.count, boundary + query.count - 1)
+                    let bytes = snapshot.data(in: position..<readEnd)
+                    var cursor = bytes.startIndex
+                    while cursor < bytes.endIndex,
+                          let match = bytes.range(of: query, in: cursor..<bytes.endIndex) {
+                        let location = position + match.lowerBound
+                        if location >= boundary { break }
+                        pending.append(NSRange(location: location, length: query.count))
+                        total += 1
+                        if total >= matchLimit {
+                            continuation.yield(SmartHighlightByteBatch(
+                                ranges: pending,
+                                reachedLimit: true
+                            ))
+                            continuation.finish()
+                            return
+                        }
+                        if pending.count >= batchSize {
+                            continuation.yield(SmartHighlightByteBatch(
+                                ranges: pending,
+                                reachedLimit: false
+                            ))
+                            pending.removeAll(keepingCapacity: true)
+                        }
+                        cursor = max(match.upperBound, match.lowerBound + 1)
+                    }
+                    position = boundary
+                }
+                if !pending.isEmpty {
+                    continuation.yield(SmartHighlightByteBatch(
+                        ranges: pending,
+                        reachedLimit: false
+                    ))
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in worker.cancel() }
+        }
+    }
+
+    private func clearSmartHighlights(for document: EditorDocument) {
+        editors[document.id]?.clearSmartHighlights()
+        byteEditors[document.id]?.clearSmartHighlights()
+    }
+
+    private func suppressSmartHighlight(for document: EditorDocument) -> Bool {
+        guard let context = currentSmartHighlightContext(for: document)
+            ?? smartHighlightContext else { return false }
+        suppressedSmartHighlightContext = context
+        smartHighlightTask?.cancel()
+        smartHighlightTask = nil
+        smartHighlightContext = nil
+        smartHighlightVisibleOnly = false
+        clearSmartHighlights(for: document)
+        return true
+    }
+
+    private func cancelSmartHighlight(clearAll: Bool) {
+        smartHighlightTask?.cancel()
+        smartHighlightTask = nil
+        smartHighlightContext = nil
+        suppressedSmartHighlightContext = nil
+        smartHighlightVisibleOnly = false
+        guard clearAll else { return }
+        editors.values.forEach { $0.clearSmartHighlights() }
+        byteEditors.values.forEach { $0.clearSmartHighlights() }
     }
 
     private func updateFindProgress(
@@ -1087,6 +1443,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     }
 
     @objc private func selectTab(_ sender: NSButton) {
+        cancelSmartHighlight(clearAll: true)
         syncActiveDocument()
         activeIndex = sender.tag
         rebuildTabs()
@@ -1099,6 +1456,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
 
     private func closeDocument(at index: Int) {
         guard documents.indices.contains(index) else { return }
+        cancelSmartHighlight(clearAll: true)
         syncActiveDocument()
         let document = documents[index]
         if document.isDirty {
@@ -1185,6 +1543,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
 
     private func showActiveDocument() {
         guard let document = activeDocument else { return }
+        if let context = smartHighlightContext,
+           context.documentID != document.id || context.mode != document.displayMode {
+            cancelSmartHighlight(clearAll: true)
+        }
         modeControl.selectedSegment = document.displayMode.rawValue
         encodingPopup.selectItem(at: document.encoding.rawValue)
         encodingPopup.isEnabled = true
@@ -1221,6 +1583,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         }
         view.isHidden = false
         updateStatus()
+        scheduleSmartHighlight(for: document)
     }
 
     private func editor(for document: EditorDocument) -> EditorTextView {
@@ -1242,6 +1605,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         }
         editor.onTextChanged = { [weak self, weak document, weak editor] in
             guard let self, let document else { return }
+            if self.smartHighlightContext?.documentID == document.id {
+                self.cancelSmartHighlight(clearAll: false)
+            }
+            self.clearSmartHighlights(for: document)
             if !self.isUndoingReplacement {
                 self.invalidateReplacementUndo(for: document.id)
             }
@@ -1251,8 +1618,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
             self.searchCaches.removeValue(forKey: document.id)
             if wasDirty != document.isDirty { self.rebuildTabs() }
         }
-        editor.onSelectionChanged = { [weak self] in self?.updateStatus() }
+        editor.onSelectionChanged = { [weak self, weak document] in
+            guard let self, let document else { return }
+            self.updateStatus()
+            self.scheduleSmartHighlight(for: document)
+        }
         editor.onFilesDropped = { [weak self] urls in self?.open(urls: urls) }
+        editor.onEscape = { [weak self, weak document] in
+            guard let self, let document else { return false }
+            return self.suppressSmartHighlight(for: document)
+        }
         editors[document.id] = editor
         document.discardFileBackedContentCache()
         return editor
@@ -1267,6 +1642,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         )
         editor.onBytesChanged = { [weak self, weak document] in
             guard let self, let document else { return }
+            if self.smartHighlightContext?.documentID == document.id {
+                self.cancelSmartHighlight(clearAll: false)
+            }
+            self.clearSmartHighlights(for: document)
             if !self.isUndoingReplacement {
                 self.invalidateReplacementUndo(for: document.id)
             }
@@ -1277,7 +1656,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
             self.rebuildTabs()
             self.updateStatus()
         }
-        editor.onSelectionChanged = { [weak self] in self?.updateStatus() }
+        editor.onSelectionChanged = { [weak self, weak document] in
+            guard let self, let document else { return }
+            self.updateStatus()
+            self.scheduleSmartHighlight(for: document)
+        }
+        editor.onViewportChanged = { [weak self, weak document] in
+            guard let self, let document else { return }
+            self.scheduleSmartHighlight(for: document)
+        }
+        editor.onEscape = { [weak self, weak document] in
+            guard let self, let document else { return false }
+            return self.suppressSmartHighlight(for: document)
+        }
         byteEditors[document.id] = editor
         return editor
     }
@@ -1297,6 +1688,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
               let mode = EditorDisplayMode(rawValue: modeControl.selectedSegment) else { return }
         let oldMode = document.displayMode
         guard mode != oldMode else { return }
+        cancelSmartHighlight(clearAll: true)
         invalidateReplacementUndo(for: document.id)
         do {
             if oldMode == .text, mode != .text, let editor = editors[document.id] {
@@ -1350,6 +1742,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         guard let document = activeDocument,
               let encoding = EditorTextEncoding(rawValue: encodingPopup.indexOfSelectedItem) else { return }
         if document.displayMode != .text {
+            cancelSmartHighlight(clearAll: true)
             document.encoding = encoding
             updateStatus()
             return
@@ -1366,6 +1759,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
             }
         }
         invalidateReplacementUndo(for: document.id)
+        cancelSmartHighlight(clearAll: true)
         searchCaches.removeValue(forKey: document.id)
         document.isDirty = false
         startProgressiveTextLoad(

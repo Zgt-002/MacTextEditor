@@ -18,13 +18,16 @@ final class EditorTextView: NSView, @preconcurrency MTEEditorViewDelegate {
     private let editorView = MTEEditorView()
     private var selectionChangePending = false
     private(set) var isIncrementallyLoading = false
+    private(set) var contentRevision = 0
     var onTextChanged: (() -> Void)?
     var onSelectionChanged: (() -> Void)?
     var onFilesDropped: (([URL]) -> Void)?
+    var onEscape: (() -> Bool)?
 
     var string: String { editorView.stringValue }
     var selectedByteRange: NSRange { editorView.selectedByteRange }
     var selectedString: String { editorView.selectedString }
+    var visibleByteRange: NSRange { editorView.visibleByteRange }
     var isModified: Bool { editorView.isModified }
     var canUndo: Bool { editorView.canUndo }
     var documentLength: Int { editorView.documentLength }
@@ -45,6 +48,7 @@ final class EditorTextView: NSView, @preconcurrency MTEEditorViewDelegate {
         editorView.fileDropHandler = { [weak self] urls in
             self?.onFilesDropped?(urls)
         }
+        editorView.escapeHandler = { [weak self] in self?.onEscape?() ?? false }
         addSubview(editorView)
         NSLayoutConstraint.activate([
             editorView.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -60,6 +64,7 @@ final class EditorTextView: NSView, @preconcurrency MTEEditorViewDelegate {
 
     func load(text: String, editable: Bool, largeDocument: Bool) {
         editorView.load(text, editable: editable, largeDocument: largeDocument)
+        contentRevision += 1
     }
 
     func beginIncrementalLoad(
@@ -97,11 +102,13 @@ final class EditorTextView: NSView, @preconcurrency MTEEditorViewDelegate {
     func finishIncrementalLoad() {
         editorView.finishIncrementalLoad()
         isIncrementallyLoading = false
+        contentRevision += 1
     }
 
     func finishIncrementalReplacement() {
         editorView.finishIncrementalReplacement()
         isIncrementallyLoading = false
+        contentRevision += 1
     }
 
     func setSavePoint() {
@@ -148,6 +155,38 @@ final class EditorTextView: NSView, @preconcurrency MTEEditorViewDelegate {
         editorView.clearSearchHighlights()
     }
 
+    func smartHighlightBatch(
+        query: String,
+        fromPosition: Int,
+        byteLimit: Int,
+        maximumCount: Int
+    ) throws -> EditorSearchBatch {
+        var searchError: NSError?
+        let batch = editorView.smartHighlightOccurrences(
+            of: query,
+            fromPosition: fromPosition,
+            byteLimit: byteLimit,
+            maximumCount: maximumCount,
+            error: &searchError
+        )
+        if let searchError { throw searchError }
+        return EditorSearchBatch(
+            matches: batch.matches.map {
+                EditorSearchMatch(
+                    byteRange: $0.byteRange,
+                    lineNumber: $0.lineNumber,
+                    lineText: $0.lineText
+                )
+            },
+            nextPosition: batch.nextPosition,
+            isFinished: batch.isFinished
+        )
+    }
+
+    func clearSmartHighlights() {
+        editorView.clearSmartHighlights()
+    }
+
     func addMarkedHighlights(_ ranges: [NSRange]) {
         editorView.addMarkedByteRanges(ranges.map(NSValue.init(range:)))
     }
@@ -190,6 +229,7 @@ final class EditorTextView: NSView, @preconcurrency MTEEditorViewDelegate {
 
     func editorViewContentDidChange(_ editorView: MTEEditorView) {
         guard !isIncrementallyLoading else { return }
+        contentRevision += 1
         onTextChanged?()
     }
 

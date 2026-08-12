@@ -4,9 +4,12 @@ import AppKit
 final class ByteEditorView: NSView {
     private let scrollView = NSScrollView()
     private let contentView: ByteContentView
+    private var boundsObserver: NSObjectProtocol?
 
     var onBytesChanged: (() -> Void)?
     var onSelectionChanged: (() -> Void)?
+    var onViewportChanged: (() -> Void)?
+    var onEscape: (() -> Bool)?
     var isEditable: Bool {
         get { contentView.isEditable }
         set { contentView.isEditable = newValue }
@@ -24,6 +27,19 @@ final class ByteEditorView: NSView {
     }
 
     var selectedByteRange: NSRange { contentView.selectedByteRange }
+    var visibleByteRange: NSRange {
+        let visibleRect = scrollView.documentVisibleRect
+        let visibleRows = max(1, Int(ceil(visibleRect.height / contentView.lineHeight)))
+        let firstVisibleRow = max(0, Int(floor(visibleRect.minY / contentView.lineHeight)))
+        let firstRow = max(0, firstVisibleRow - visibleRows * 2)
+        let lastRow = min(
+            (contentView.store.count + contentView.bytesPerRow - 1) / contentView.bytesPerRow,
+            firstVisibleRow + visibleRows * 3
+        )
+        let start = min(contentView.store.count, firstRow * contentView.bytesPerRow)
+        let end = min(contentView.store.count, lastRow * contentView.bytesPerRow)
+        return NSRange(location: start, length: max(0, end - start))
+    }
 
     init(store: ByteStore, mode: EditorDisplayMode, editable: Bool) {
         self.mode = mode == .text ? .hexadecimal : mode
@@ -37,6 +53,7 @@ final class ByteEditorView: NSView {
         scrollView.autohidesScrollers = false
         scrollView.verticalScroller = ArrowCursorScroller(frame: .zero)
         scrollView.horizontalScroller = ArrowCursorScroller(frame: .zero)
+        scrollView.contentView.postsBoundsChangedNotifications = true
         scrollView.documentView = contentView
         addSubview(scrollView)
         NSLayoutConstraint.activate([
@@ -47,10 +64,26 @@ final class ByteEditorView: NSView {
         ])
         contentView.onBytesChanged = { [weak self] in self?.onBytesChanged?() }
         contentView.onSelectionChanged = { [weak self] in self?.onSelectionChanged?() }
+        contentView.onEscape = { [weak self] in self?.onEscape?() ?? false }
+        boundsObserver = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.onViewportChanged?()
+            }
+        }
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        if let boundsObserver {
+            NotificationCenter.default.removeObserver(boundsObserver)
+        }
     }
 
     override func layout() {
@@ -83,6 +116,23 @@ final class ByteEditorView: NSView {
 
     func clearSearchHighlights() {
         contentView.searchHighlights = []
+    }
+
+    func setVisibleSmartHighlights(_ ranges: [NSRange]) {
+        contentView.visibleSmartHighlights = ranges.sorted { $0.location < $1.location }
+    }
+
+    func addSmartHighlights(_ ranges: [NSRange]) {
+        contentView.smartHighlights.append(contentsOf: ranges)
+    }
+
+    func clearFullSmartHighlights() {
+        contentView.smartHighlights = []
+    }
+
+    func clearSmartHighlights() {
+        contentView.visibleSmartHighlights = []
+        contentView.smartHighlights = []
     }
 
     func addMarkedHighlights(_ ranges: [NSRange]) {
@@ -121,11 +171,18 @@ private final class ByteContentView: NSView {
 
     var onBytesChanged: (() -> Void)?
     var onSelectionChanged: (() -> Void)?
+    var onEscape: (() -> Bool)?
     var isEditable = true
     var searchHighlights: [NSRange] = [] {
         didSet { needsDisplay = true }
     }
     var markedOffsets = IndexSet() {
+        didSet { needsDisplay = true }
+    }
+    var visibleSmartHighlights: [NSRange] = [] {
+        didSet { needsDisplay = true }
+    }
+    var smartHighlights: [NSRange] = [] {
         didSet { needsDisplay = true }
     }
     var mode: EditorDisplayMode {
@@ -245,7 +302,14 @@ private final class ByteContentView: NSView {
             }
         }
 
-        guard let byteInRow else { return }
+        guard let byteInRow else {
+            selectedOffset = nil
+            selectedLength = 0
+            selectedComponent = 0
+            needsDisplay = true
+            onSelectionChanged?()
+            return
+        }
         let offset = row * bytesPerRow + byteInRow
         guard offset < store.count else { return }
         selectedOffset = offset
@@ -256,6 +320,9 @@ private final class ByteContentView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53, onEscape?() == true {
+            return
+        }
         if event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command) {
             super.keyDown(with: event)
             return
@@ -453,6 +520,9 @@ private final class ByteContentView: NSView {
                 color = NSColor.systemYellow.withAlphaComponent(0.55)
             } else if markedOffsets.contains(offset) {
                 color = NSColor.systemOrange.withAlphaComponent(0.48)
+            } else if isHighlighted(offset, in: visibleSmartHighlights)
+                        || isHighlighted(offset, in: smartHighlights) {
+                color = NSColor.systemGreen.withAlphaComponent(0.35)
             } else {
                 color = nil
             }
@@ -484,18 +554,22 @@ private final class ByteContentView: NSView {
     }
 
     private func isSearchHighlighted(_ offset: Int) -> Bool {
+        isHighlighted(offset, in: searchHighlights)
+    }
+
+    private func isHighlighted(_ offset: Int, in ranges: [NSRange]) -> Bool {
         var lower = 0
-        var upper = searchHighlights.count
+        var upper = ranges.count
         while lower < upper {
             let middle = (lower + upper) / 2
-            if searchHighlights[middle].location <= offset {
+            if ranges[middle].location <= offset {
                 lower = middle + 1
             } else {
                 upper = middle
             }
         }
         guard lower > 0 else { return false }
-        let range = searchHighlights[lower - 1]
+        let range = ranges[lower - 1]
         return offset < NSMaxRange(range)
     }
 

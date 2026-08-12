@@ -38,11 +38,13 @@ typedef NS_OPTIONS(NSUInteger, MTEFindOptions) {
 
 @property(nonatomic, weak, nullable) id<MTEEditorViewDelegate> delegate;
 @property(nonatomic, copy, nullable) void (^fileDropHandler)(NSArray<NSURL *> *urls);
+@property(nonatomic, copy, nullable) BOOL (^escapeHandler)(void);
 @property(nonatomic, getter=isEditable) BOOL editable;
 @property(nonatomic, readonly, getter=isModified) BOOL modified;
 @property(nonatomic, readonly) BOOL canUndo;
 @property(nonatomic, readonly) NSRange selectedByteRange;
 @property(nonatomic, copy, readonly) NSString *selectedString;
+@property(nonatomic, readonly) NSRange visibleByteRange;
 @property(nonatomic, readonly) NSInteger currentLine;
 @property(nonatomic, readonly) NSInteger currentColumn;
 @property(nonatomic, readonly) NSInteger documentLength;
@@ -77,8 +79,15 @@ typedef NS_OPTIONS(NSUInteger, MTEFindOptions) {
                                           byteLimit:(NSInteger)byteLimit
                                        maximumCount:(NSInteger)maximumCount
                                               error:(NSError **)error;
+- (MTEEditorSearchBatch *)smartHighlightOccurrencesOfString:(NSString *)query
+                                               fromPosition:(NSInteger)fromPosition
+                                                  byteLimit:(NSInteger)byteLimit
+                                               maximumCount:(NSInteger)maximumCount
+                                                      error:(NSError **)error
+    NS_SWIFT_NAME(smartHighlightOccurrences(of:fromPosition:byteLimit:maximumCount:error:));
 - (void)selectAndRevealByteRange:(NSRange)range;
 - (void)clearSearchHighlights;
+- (void)clearSmartHighlights;
 - (void)addMarkedByteRanges:(NSArray<NSValue *> *)ranges;
 - (void)clearMarkedHighlights;
 - (void)setSavePoint;
