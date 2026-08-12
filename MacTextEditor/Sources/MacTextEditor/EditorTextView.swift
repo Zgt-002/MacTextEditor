@@ -143,6 +143,14 @@ final class EditorTextView: NSView, @preconcurrency MTEEditorViewDelegate {
         editorView.clearSearchHighlights()
     }
 
+    func addMarkedHighlights(_ ranges: [NSRange]) {
+        editorView.addMarkedByteRanges(ranges.map(NSValue.init(range:)))
+    }
+
+    func clearMarkedHighlights() {
+        editorView.clearMarkedHighlights()
+    }
+
     func replaceSelection(with replacement: String) {
         editorView.replaceSelectedText(with: replacement)
     }

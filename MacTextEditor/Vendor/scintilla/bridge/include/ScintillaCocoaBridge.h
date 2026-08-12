@@ -78,6 +78,8 @@ typedef NS_OPTIONS(NSUInteger, MTEFindOptions) {
                                               error:(NSError **)error;
 - (void)selectAndRevealByteRange:(NSRange)range;
 - (void)clearSearchHighlights;
+- (void)addMarkedByteRanges:(NSArray<NSValue *> *)ranges;
+- (void)clearMarkedHighlights;
 - (void)setSavePoint;
 - (void)focusEditor;
 

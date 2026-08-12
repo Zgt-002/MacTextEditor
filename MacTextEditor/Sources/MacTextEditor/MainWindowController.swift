@@ -137,6 +137,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     private let findAllButton = NSButton(title: "查找全部", target: nil, action: nil)
     private let replaceButton = NSButton(title: "替换", target: nil, action: nil)
     private let replaceAllButton = NSButton(title: "全部替换", target: nil, action: nil)
+    private let markAllButton = NSButton(title: "标记全部", target: nil, action: nil)
+    private let clearMarksButton = NSButton(title: "清除标记", target: nil, action: nil)
     private let scopePopup = NSPopUpButton()
     private let caseCheckbox = NSButton(checkboxWithTitle: "区分大小写", target: nil, action: nil)
     private let wholeWordCheckbox = NSButton(checkboxWithTitle: "全词", target: nil, action: nil)
@@ -290,6 +292,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         replaceButton.action = #selector(replaceCurrent)
         replaceAllButton.target = self
         replaceAllButton.action = #selector(replaceAll)
+        markAllButton.target = self
+        markAllButton.action = #selector(markAll)
+        clearMarksButton.target = self
+        clearMarksButton.action = #selector(clearMarks)
         let closeButton = button("关闭", #selector(closeFindPanel))
         closeButton.keyEquivalent = "\u{1b}"
 
@@ -327,7 +333,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         let scopeRow = NSStackView(views: [
             scopeLabel, scopePopup, flexibleSpace(),
             previousButton, nextButton, findAllButton,
-            replaceButton, replaceAllButton
+            replaceButton, replaceAllButton, markAllButton, clearMarksButton
         ])
         scopeRow.orientation = .horizontal
         scopeRow.alignment = .centerY
@@ -369,8 +375,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         let replaceItem = NSTabViewItem(identifier: "replace")
         replaceItem.label = "替换"
         replaceItem.view = NSView()
+        let markItem = NSTabViewItem(identifier: "mark")
+        markItem.label = "标记"
+        markItem.view = NSView()
         findTabView.addTabViewItem(findItem)
         findTabView.addTabViewItem(replaceItem)
+        findTabView.addTabViewItem(markItem)
         findTabView.selectTabViewItem(findItem)
         findTabView.delegate = self
         attachFindPanelBody(to: findItem.view!)
@@ -409,14 +419,20 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     }
 
     private func updateFindPanelMode() {
-        let isReplaceMode = findTabView.indexOfTabViewItem(findTabView.selectedTabViewItem!) == 1
+        let selectedIndex = findTabView.indexOfTabViewItem(findTabView.selectedTabViewItem!)
+        let isReplaceMode = selectedIndex == 1
+        let isMarkMode = selectedIndex == 2
         replaceLabel.alphaValue = isReplaceMode ? 1 : 0
         replaceField.alphaValue = isReplaceMode ? 1 : 0
-        replaceField.isEnabled = isReplaceMode
-        findAllButton.isHidden = isReplaceMode
+        replaceField.isEnabled = isReplaceMode && !isFindingAll
+        previousButton.isHidden = isMarkMode
+        nextButton.isHidden = isMarkMode
+        findAllButton.isHidden = isReplaceMode || isMarkMode
         replaceButton.isHidden = !isReplaceMode
         replaceAllButton.isHidden = !isReplaceMode
-        findPanel.title = isReplaceMode ? "替换" : "查找"
+        markAllButton.isHidden = !isMarkMode
+        clearMarksButton.isHidden = !isMarkMode
+        findPanel.title = isReplaceMode ? "替换" : isMarkMode ? "标记" : "查找"
     }
 
     private func setFindAllRunning(_ running: Bool) {
@@ -431,6 +447,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         findAllButton.isEnabled = !running
         replaceButton.isEnabled = !running && !isReplacingAll
         replaceAllButton.isEnabled = !running && !isReplacingAll
+        markAllButton.isEnabled = !running
+        clearMarksButton.isEnabled = !running
         findProgress.isHidden = !running
         findSpinner.isHidden = !running
         if running {
@@ -445,7 +463,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         documentName: String,
         scannedBytes: Int,
         totalBytes: Int,
-        matchCount: Int
+        matchCount: Int,
+        action: String = "查找"
     ) {
         let progress = totalBytes > 0
             ? min(1, Double(scannedBytes) / Double(totalBytes))
@@ -460,7 +479,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         )
         findProgress.doubleValue = progress
         findStatus.textColor = .secondaryLabelColor
-        findStatus.stringValue = "正在查找 \(Int(progress * 100))% · 已找到\(matchCount)项 · \(scannedSize)/\(totalSize) · \(documentName)"
+        let countLabel = action == "标记" ? "已标记" : "已找到"
+        findStatus.stringValue = "正在\(action) \(Int(progress * 100))% · \(countLabel)\(matchCount)项 · \(scannedSize)/\(totalSize) · \(documentName)"
     }
 
     func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
@@ -1597,6 +1617,69 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         }
     }
 
+    private func markMatches(
+        in editor: EditorTextView,
+        query: String,
+        options: SearchOptions,
+        progress: ((Int, Int) -> Void)? = nil
+    ) async throws -> Int {
+        var count = 0
+        var position = 0
+        editor.clearSearchHighlights()
+        defer { editor.clearSearchHighlights() }
+        while true {
+            try Task.checkCancellation()
+            let batch = try editor.searchBatch(
+                query: query,
+                options: options,
+                fromPosition: position,
+                direction: 1,
+                byteLimit: searchChunkByteCount,
+                maximumCount: searchBatchMatchCount
+            )
+            editor.addMarkedHighlights(batch.matches.map(\.byteRange))
+            count += batch.matches.count
+            progress?(
+                count,
+                batch.isFinished ? editor.documentLength : batch.nextPosition
+            )
+            if batch.isFinished { return count }
+            position = batch.nextPosition
+            await Task.yield()
+        }
+    }
+
+    private func markByteMatches(
+        in document: EditorDocument,
+        bytes: Data,
+        progress: ((Int, Int) -> Void)? = nil
+    ) async throws -> Int {
+        let documentEditor = byteEditor(for: document)
+        var count = 0
+        var position = 0
+        while true {
+            try Task.checkCancellation()
+            let batch = document.byteStore.search(
+                for: bytes,
+                fromPosition: position,
+                direction: 1,
+                byteLimit: searchChunkByteCount,
+                maximumCount: searchBatchMatchCount
+            )
+            documentEditor.addMarkedHighlights(batch.offsets.map {
+                NSRange(location: $0, length: bytes.count)
+            })
+            count += batch.offsets.count
+            progress?(
+                count,
+                batch.isFinished ? document.byteStore.count : batch.nextPosition
+            )
+            if batch.isFinished { return count }
+            position = batch.nextPosition
+            await Task.yield()
+        }
+    }
+
     private func byteSearchMatch(
         in store: ByteStore,
         offset: Int,
@@ -1619,6 +1702,136 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
             lineNumber: rowOffset / bytesPerRow + 1,
             lineText: lineText
         )
+    }
+
+    @objc private func markAll() {
+        guard !isReplacingAll, !isFindingAll else { return }
+        if scopePopup.indexOfSelectedItem == 0, activeDocument?.isTextLoading == true {
+            findStatus.textColor = .systemOrange
+            findStatus.stringValue = "Text加载完成后才能标记"
+            return
+        }
+        let query = findField.stringValue
+        guard !query.isEmpty else {
+            findStatus.textColor = .systemOrange
+            findStatus.stringValue = "请输入查找内容"
+            return
+        }
+        let options = searchOptions
+        let indexes = scopePopup.indexOfSelectedItem == 0
+            ? [activeIndex]
+            : Array(documents.indices)
+        var documentLengths: [UUID: Int] = [:]
+        for index in indexes where documents.indices.contains(index) {
+            let document = documents[index]
+            guard !document.isTextLoading,
+                  document.displayMode != .text || document.hasDecodedText else { continue }
+            documentLengths[document.id] = document.displayMode == .text
+                ? editor(for: document).documentLength
+                : document.byteStore.count
+        }
+        let totalBytes = documentLengths.values.reduce(0, +)
+        searchTask?.cancel()
+        setResultsVisible(false)
+        let requestID = UUID()
+        findAllRequestID = requestID
+        setFindAllRunning(true)
+        findStatus.textColor = .secondaryLabelColor
+        findStatus.stringValue = "正在准备标记…"
+
+        searchTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if findAllRequestID == requestID {
+                    findAllRequestID = nil
+                    setFindAllRunning(false)
+                }
+            }
+            var total = 0
+            var completedBytes = 0
+            do {
+                for index in indexes where documents.indices.contains(index) {
+                    try Task.checkCancellation()
+                    let document = documents[index]
+                    if document.isTextLoading { continue }
+                    let mode = document.displayMode
+                    if mode == .text, !document.hasDecodedText { continue }
+                    let documentLength = documentLengths[document.id] ?? 0
+                    let completedBeforeDocument = completedBytes
+                    let marksBeforeDocument = total
+                    var lastProgressUpdate = 0.0
+                    let reportProgress: (Int, Int) -> Void = { count, scannedBytes in
+                        let now = ProcessInfo.processInfo.systemUptime
+                        guard now - lastProgressUpdate >= 0.1 || scannedBytes >= documentLength else {
+                            return
+                        }
+                        lastProgressUpdate = now
+                        self.updateFindProgress(
+                            documentName: document.displayName,
+                            scannedBytes: completedBeforeDocument + scannedBytes,
+                            totalBytes: totalBytes,
+                            matchCount: marksBeforeDocument + count,
+                            action: "标记"
+                        )
+                    }
+                    let count: Int
+                    if mode == .text {
+                        count = try await markMatches(
+                            in: editor(for: document),
+                            query: query,
+                            options: options,
+                            progress: reportProgress
+                        )
+                    } else {
+                        count = try await markByteMatches(
+                            in: document,
+                            bytes: byteQuery(from: query, mode: mode),
+                            progress: reportProgress
+                        )
+                    }
+                    total += count
+                    completedBytes += documentLength
+                    updateFindProgress(
+                        documentName: document.displayName,
+                        scannedBytes: completedBytes,
+                        totalBytes: totalBytes,
+                        matchCount: total,
+                        action: "标记"
+                    )
+                }
+                if total == 0 {
+                    findStatus.textColor = .systemOrange
+                    findStatus.stringValue = "未找到匹配内容"
+                } else {
+                    findStatus.textColor = .secondaryLabelColor
+                    findStatus.stringValue = "标记完成 · 共\(total)项"
+                }
+            } catch is CancellationError {
+                if findAllRequestID == requestID {
+                    findStatus.textColor = .secondaryLabelColor
+                    findStatus.stringValue = "已取消标记"
+                }
+            } catch {
+                if findAllRequestID == requestID {
+                    findStatus.textColor = .systemRed
+                    findStatus.stringValue = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    @objc private func clearMarks() {
+        guard !isReplacingAll, !isFindingAll else { return }
+        let indexes = scopePopup.indexOfSelectedItem == 0
+            ? [activeIndex]
+            : Array(documents.indices)
+        for index in indexes where documents.indices.contains(index) {
+            let documentID = documents[index].id
+            editors[documentID]?.clearMarkedHighlights()
+            byteEditors[documentID]?.clearMarkedHighlights()
+        }
+        findStatus.textColor = .secondaryLabelColor
+        findStatus.stringValue = "已清除标记"
     }
 
     @objc private func findAll() {

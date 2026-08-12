@@ -5,6 +5,7 @@
 
 static NSString *const MTEEditorErrorDomain = @"MacTextEditor.Scintilla";
 static const int MTESearchIndicator = 8;
+static const int MTEMarkIndicator = 9;
 static const int MTELineNumberMargin = 0;
 static const int MTELineNumberPaddingMargin = 1;
 static const int MTESeparatorMargin = 2;
@@ -168,6 +169,10 @@ static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
     [_scintilla setColorProperty:SCI_INDICSETFORE parameter:MTESearchIndicator value:NSColor.systemYellowColor];
     [_scintilla setGeneralProperty:SCI_INDICSETALPHA parameter:MTESearchIndicator value:90];
     [_scintilla setGeneralProperty:SCI_INDICSETUNDER parameter:MTESearchIndicator value:1];
+    [_scintilla setGeneralProperty:SCI_INDICSETSTYLE parameter:MTEMarkIndicator value:INDIC_ROUNDBOX];
+    [_scintilla setColorProperty:SCI_INDICSETFORE parameter:MTEMarkIndicator value:NSColor.systemOrangeColor];
+    [_scintilla setGeneralProperty:SCI_INDICSETALPHA parameter:MTEMarkIndicator value:105];
+    [_scintilla setGeneralProperty:SCI_INDICSETUNDER parameter:MTEMarkIndicator value:1];
     [self updateLineNumberMarginWidth];
 }
 
@@ -585,6 +590,26 @@ static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
 - (void)clearSearchHighlights {
     const long length = [_scintilla getGeneralProperty:SCI_GETLENGTH];
     [_scintilla setGeneralProperty:SCI_SETINDICATORCURRENT value:MTESearchIndicator];
+    [_scintilla setGeneralProperty:SCI_INDICATORCLEARRANGE parameter:0 value:length];
+}
+
+- (void)addMarkedByteRanges:(NSArray<NSValue *> *)ranges {
+    const long documentLength = [_scintilla getGeneralProperty:SCI_GETLENGTH];
+    [_scintilla setGeneralProperty:SCI_SETINDICATORCURRENT value:MTEMarkIndicator];
+    for (NSValue *value in ranges) {
+        const NSRange range = value.rangeValue;
+        if (range.location >= documentLength || range.length == 0)
+            continue;
+        const long length = MIN((long)range.length, documentLength - (long)range.location);
+        [_scintilla setGeneralProperty:SCI_INDICATORFILLRANGE
+                             parameter:range.location
+                                 value:length];
+    }
+}
+
+- (void)clearMarkedHighlights {
+    const long length = [_scintilla getGeneralProperty:SCI_GETLENGTH];
+    [_scintilla setGeneralProperty:SCI_SETINDICATORCURRENT value:MTEMarkIndicator];
     [_scintilla setGeneralProperty:SCI_INDICATORCLEARRANGE parameter:0 value:length];
 }
 

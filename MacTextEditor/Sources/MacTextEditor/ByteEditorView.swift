@@ -85,6 +85,14 @@ final class ByteEditorView: NSView {
         contentView.searchHighlights = []
     }
 
+    func addMarkedHighlights(_ ranges: [NSRange]) {
+        contentView.addMarkedHighlights(ranges)
+    }
+
+    func clearMarkedHighlights() {
+        contentView.markedOffsets.removeAll()
+    }
+
     func focus() {
         window?.makeFirstResponder(contentView)
     }
@@ -115,6 +123,9 @@ private final class ByteContentView: NSView {
     var onSelectionChanged: (() -> Void)?
     var isEditable = true
     var searchHighlights: [NSRange] = [] {
+        didSet { needsDisplay = true }
+    }
+    var markedOffsets = IndexSet() {
         didSet { needsDisplay = true }
     }
     var mode: EditorDisplayMode {
@@ -152,6 +163,12 @@ private final class ByteContentView: NSView {
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
+
+    func addMarkedHighlights(_ ranges: [NSRange]) {
+        for range in ranges where range.length > 0 {
+            markedOffsets.insert(integersIn: range.location..<NSMaxRange(range))
+        }
+    }
 
     func reloadData() {
         if let selectedOffset, selectedOffset >= store.count {
@@ -434,6 +451,8 @@ private final class ByteContentView: NSView {
                 color = NSColor.selectedTextBackgroundColor.withAlphaComponent(0.75)
             } else if isSearchHighlighted(offset) {
                 color = NSColor.systemYellow.withAlphaComponent(0.55)
+            } else if markedOffsets.contains(offset) {
+                color = NSColor.systemOrange.withAlphaComponent(0.48)
             } else {
                 color = nil
             }
