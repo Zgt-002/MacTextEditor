@@ -1485,7 +1485,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         in editor: EditorTextView,
         query: String,
         options: SearchOptions,
-        progress: ((Int, Int) -> Void)? = nil
+        progress: ((Int, Int) -> Void)? = nil,
+        resultBatch: (([EditorSearchMatch], Bool) -> Void)? = nil
     ) async throws -> [EditorSearchMatch] {
         var matches: [EditorSearchMatch] = []
         var position = 0
@@ -1500,6 +1501,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                 maximumCount: searchBatchMatchCount
             )
             matches.append(contentsOf: batch.matches)
+            resultBatch?(batch.matches, batch.isFinished)
             progress?(
                 matches.count,
                 batch.isFinished ? editor.documentLength : batch.nextPosition
@@ -1586,7 +1588,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         in document: EditorDocument,
         bytes: Data,
         mode: EditorDisplayMode,
-        progress: ((Int, Int) -> Void)? = nil
+        progress: ((Int, Int) -> Void)? = nil,
+        resultBatch: (([EditorSearchMatch], Bool) -> Void)? = nil
     ) async throws -> [EditorSearchMatch] {
         var matches: [EditorSearchMatch] = []
         var position = 0
@@ -1599,14 +1602,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                 byteLimit: searchChunkByteCount,
                 maximumCount: searchBatchMatchCount
             )
-            matches.append(contentsOf: batch.offsets.map {
+            let batchMatches = batch.offsets.map {
                 byteSearchMatch(
                     in: document.byteStore,
                     offset: $0,
                     length: bytes.count,
                     mode: mode
                 )
-            })
+            }
+            matches.append(contentsOf: batchMatches)
+            resultBatch?(batchMatches, batch.isFinished)
             progress?(
                 matches.count,
                 batch.isFinished ? document.byteStore.count : batch.nextPosition
@@ -1894,6 +1899,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                     let completedBeforeDocument = completedBytes
                     let matchesBeforeDocument = total
                     var lastProgressUpdate = 0.0
+                    var lastResultsUpdate = 0.0
+                    var headerRow: Int?
+                    var displayedMatchCount = 0
                     let reportProgress: (Int, Int) -> Void = { count, scannedBytes in
                         let now = ProcessInfo.processInfo.systemUptime
                         guard now - lastProgressUpdate >= 0.1 || scannedBytes >= documentLength else {
@@ -1907,6 +1915,46 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                             matchCount: matchesBeforeDocument + count
                         )
                     }
+                    let appendResultBatch: ([EditorSearchMatch], Bool) -> Void = { batch, isFinished in
+                        guard self.findAllRequestID == requestID else { return }
+                        if !batch.isEmpty {
+                            if headerRow == nil {
+                                headerRow = self.searchResultItems.count
+                                self.searchResultItems.append(SearchResultItem(
+                                    headerTitle: "\(document.displayName)（正在查找）",
+                                    documentID: nil,
+                                    mode: nil,
+                                    match: nil
+                                ))
+                            }
+                            self.searchResultItems.append(contentsOf: batch.map {
+                                SearchResultItem(
+                                    headerTitle: nil,
+                                    documentID: document.id,
+                                    mode: mode,
+                                    match: $0
+                                )
+                            })
+                            displayedMatchCount += batch.count
+                        }
+                        guard let headerRow else { return }
+                        let now = ProcessInfo.processInfo.systemUptime
+                        guard isFinished || now - lastResultsUpdate >= 0.1 else { return }
+                        lastResultsUpdate = now
+                        self.searchResultItems[headerRow] = SearchResultItem(
+                            headerTitle: isFinished
+                                ? "\(document.displayName)（\(displayedMatchCount)项）"
+                                : "\(document.displayName)（正在查找 · 已找到\(displayedMatchCount)项）",
+                            documentID: nil,
+                            mode: nil,
+                            match: nil
+                        )
+                        self.resultsTable.noteNumberOfRowsChanged()
+                        self.resultsTable.reloadData(
+                            forRowIndexes: IndexSet(integer: headerRow),
+                            columnIndexes: IndexSet(integer: 0)
+                        )
+                    }
                     let matches: [EditorSearchMatch]
                     if let cached = cachedMatches(
                         for: document,
@@ -1915,6 +1963,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                         mode: mode
                     ) {
                         matches = cached
+                        var offset = 0
+                        repeat {
+                            let end = min(offset + searchBatchMatchCount, matches.count)
+                            let batch = offset < end ? Array(matches[offset..<end]) : []
+                            appendResultBatch(batch, end == matches.count)
+                            offset = end
+                            if offset < matches.count {
+                                try Task.checkCancellation()
+                                await Task.yield()
+                            }
+                        } while offset < matches.count
                     } else if mode == .text {
                         let documentEditor = editor(for: document)
                         documentEditor.clearSearchHighlights()
@@ -1922,7 +1981,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                             in: documentEditor,
                             query: query,
                             options: options,
-                            progress: reportProgress
+                            progress: reportProgress,
+                            resultBatch: appendResultBatch
                         )
                         searchCaches[document.id] = SearchCache(
                             query: query,
@@ -1938,7 +1998,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                             in: document,
                             bytes: bytes,
                             mode: mode,
-                            progress: reportProgress
+                            progress: reportProgress,
+                            resultBatch: appendResultBatch
                         )
                         documentEditor.setSearchHighlights(matches.map(\.byteRange))
                         searchCaches[document.id] = SearchCache(
@@ -1956,27 +2017,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                         totalBytes: totalBytes,
                         matchCount: total
                     )
-                    guard !matches.isEmpty else { continue }
-                    searchResultItems.append(SearchResultItem(
-                        headerTitle: "\(document.displayName)（\(matches.count)项）",
-                        documentID: nil,
-                        mode: nil,
-                        match: nil
-                    ))
-                    for (offset, match) in matches.enumerated() {
-                        searchResultItems.append(SearchResultItem(
-                            headerTitle: nil,
-                            documentID: document.id,
-                            mode: mode,
-                            match: match
-                        ))
-                        if offset.isMultiple(of: searchBatchMatchCount) {
-                            resultsTable.reloadData()
-                            try Task.checkCancellation()
-                            await Task.yield()
-                        }
-                    }
-                    resultsTable.reloadData()
                 }
                 if searchResultItems.isEmpty {
                     searchResultItems.append(SearchResultItem(
@@ -1985,8 +2025,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                         mode: nil,
                         match: nil
                     ))
+                    resultsTable.noteNumberOfRowsChanged()
                 }
-                resultsTable.reloadData()
                 if total == 0 {
                     findStatus.textColor = .systemOrange
                     findStatus.stringValue = "未找到匹配内容"
@@ -2169,10 +2209,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                         let matches = try await collectByteMatches(
                             in: document,
                             bytes: query,
-                            mode: document.displayMode
-                        ) { count, _ in
-                            self.findStatus.stringValue = "正在扫描\(document.displayName)：\(count)项"
-                        }
+                            mode: document.displayMode,
+                            progress: { count, _ in
+                                self.findStatus.stringValue = "正在扫描\(document.displayName)：\(count)项"
+                            }
+                        )
                         for (offset, match) in matches.enumerated() {
                             try document.byteStore.replaceBytes(
                                 in: match.byteRange.location..<NSMaxRange(match.byteRange),
