@@ -178,7 +178,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     private let findProgress = NSProgressIndicator()
     private let resultsTable = NSTableView()
     private let resultsScroll = NSScrollView()
-    private var resultsPaneHeight: CGFloat = 130
+    private let resultsContainer = NSView()
+    private var resultsPaneHeight: CGFloat = 200
 
     init() {
         let contentView = FileDropView(frame: .zero)
@@ -542,6 +543,26 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     }
 
     private func configureResults() {
+        let titleLabel = NSTextField(labelWithString: "查找结果")
+        titleLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        titleLabel.textColor = .secondaryLabelColor
+        let closeButton = NSButton(
+            title: "×",
+            target: self,
+            action: #selector(closeSearchResults)
+        )
+        closeButton.isBordered = false
+        closeButton.font = .systemFont(ofSize: 16)
+        closeButton.contentTintColor = .secondaryLabelColor
+        closeButton.toolTip = "关闭搜索结果"
+        closeButton.setAccessibilityLabel("关闭搜索结果")
+        closeButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        let header = NSStackView(views: [titleLabel, flexibleSpace(), closeButton])
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.edgeInsets = NSEdgeInsets(top: 2, left: 8, bottom: 2, right: 4)
+        header.heightAnchor.constraint(equalToConstant: 26).isActive = true
+
         resultsScroll.hasVerticalScroller = true
         resultsScroll.verticalScroller = ArrowCursorScroller(frame: .zero)
         resultsScroll.hasHorizontalScroller = true
@@ -562,19 +583,32 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         resultsTable.delegate = self
         resultsTable.allowsMultipleSelection = false
         resultsScroll.documentView = resultsTable
-        resultsScroll.isHidden = true
+
+        let stack = NSStackView(views: [header, resultsScroll])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .width
+        stack.spacing = 0
+        resultsContainer.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: resultsContainer.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: resultsContainer.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: resultsContainer.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: resultsContainer.bottomAnchor)
+        ])
+        resultsContainer.isHidden = true
     }
 
     private func setResultsVisible(_ visible: Bool) {
         if visible {
-            guard resultsScroll.superview == nil else { return }
-            resultsScroll.isHidden = false
-            editorResultsSplit.addSubview(resultsScroll)
+            guard resultsContainer.superview == nil else { return }
+            resultsContainer.isHidden = false
+            editorResultsSplit.addSubview(resultsContainer)
             editorResultsSplit.setHoldingPriority(.defaultLow, forSubviewAt: 0)
             editorResultsSplit.setHoldingPriority(.defaultHigh, forSubviewAt: 1)
             editorResultsSplit.adjustSubviews()
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.resultsScroll.superview != nil else { return }
+                guard let self, self.resultsContainer.superview != nil else { return }
                 let availableHeight = max(
                     60,
                     self.editorResultsSplit.bounds.height
@@ -590,12 +624,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                 )
             }
         } else {
-            guard resultsScroll.superview != nil else { return }
-            resultsPaneHeight = max(resultsScroll.frame.height, 60)
-            resultsScroll.removeFromSuperview()
-            resultsScroll.isHidden = true
+            guard resultsContainer.superview != nil else { return }
+            resultsPaneHeight = max(resultsContainer.frame.height, 60)
+            resultsContainer.removeFromSuperview()
+            resultsContainer.isHidden = true
             editorResultsSplit.adjustSubviews()
         }
+    }
+
+    @objc private func closeSearchResults() {
+        setResultsVisible(false)
     }
 
     func splitView(
