@@ -142,6 +142,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
 
     private let searchChunkByteCount = 4 * 1024 * 1024
     private let searchBatchMatchCount = 512
+    private let maximumFindPrefillByteCount = 4 * 1024
 
     private let tabStack = NSStackView()
     private let tabScroll = NSScrollView()
@@ -1383,6 +1384,39 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     }
 
     private func presentFindPanel(tabIndex: Int) {
+        if let document = activeDocument, !document.isTextLoading {
+            if document.displayMode == .text, let documentEditor = editors[document.id] {
+                let selectedRange = documentEditor.selectedByteRange
+                if selectedRange.length > 0 {
+                    if selectedRange.length <= maximumFindPrefillByteCount {
+                        findField.stringValue = documentEditor.selectedString
+                    } else {
+                        findStatus.stringValue = "选中内容过大，已保留原查找内容"
+                    }
+                }
+            } else if let documentEditor = byteEditors[document.id] {
+                let selectedRange = documentEditor.selectedByteRange
+                if selectedRange.length > 0 {
+                    if selectedRange.length <= maximumFindPrefillByteCount {
+                        let upperBound = min(document.byteStore.count, NSMaxRange(selectedRange))
+                        let selectedBytes = document.byteStore.data(
+                            in: selectedRange.location..<upperBound
+                        )
+                        if document.displayMode == .hexadecimal {
+                            findField.stringValue = selectedBytes
+                                .map { String(format: "%02X", $0) }
+                                .joined(separator: " ")
+                        } else {
+                            findField.stringValue = selectedBytes
+                                .map { String($0, radix: 2).leftPadding(toLength: 8, with: "0") }
+                                .joined(separator: " ")
+                        }
+                    } else {
+                        findStatus.stringValue = "选中内容过大，已保留原查找内容"
+                    }
+                }
+            }
+        }
         findTabView.selectTabViewItem(at: tabIndex)
         updateFindPanelMode()
         findPanel.alphaValue = 1
