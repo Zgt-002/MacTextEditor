@@ -63,11 +63,33 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         let matches: [EditorSearchMatch]
     }
 
+    private struct SearchResultSource {
+        let documentID: UUID
+        let fileURL: URL?
+        let fileSize: UInt64
+        let modificationDate: Date?
+    }
+
     private struct SearchResultItem {
         let headerTitle: String?
         let documentID: UUID?
         let mode: EditorDisplayMode?
         let match: EditorSearchMatch?
+        let source: SearchResultSource?
+
+        init(
+            headerTitle: String?,
+            documentID: UUID?,
+            mode: EditorDisplayMode?,
+            match: EditorSearchMatch?,
+            source: SearchResultSource? = nil
+        ) {
+            self.headerTitle = headerTitle
+            self.documentID = documentID
+            self.mode = mode
+            self.match = match
+            self.source = source
+        }
 
         var title: String {
             if let match {
@@ -78,6 +100,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
             }
             return headerTitle ?? ""
         }
+    }
+
+    private struct PendingSearchResultJump {
+        let documentID: UUID
+        let source: SearchResultSource
+        let mode: EditorDisplayMode
+        let match: EditorSearchMatch
     }
 
     private var documents: [EditorDocument] = []
@@ -91,6 +120,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     private var resultOptions = SearchOptions()
     private var searchTask: Task<Void, Never>?
     private var findAllRequestID: UUID?
+    private var pendingSearchResultJump: PendingSearchResultJump?
     private var isFindingAll = false
     private var isReplacingAll = false
     private var activeIndex = -1
@@ -621,7 +651,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         let item = searchResultItems[row]
         if item.documentID == nil {
             cell.textField?.font = .boldSystemFont(ofSize: 11)
-            cell.textField?.stringValue = item.title
+            if let source = item.source,
+               documentIndex(for: source) == nil {
+                cell.textField?.stringValue = "\(item.title) · 已关闭"
+            } else {
+                cell.textField?.stringValue = item.title
+            }
         } else {
             cell.textField?.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
             cell.textField?.attributedStringValue = highlightedResultText(item.title)
@@ -711,6 +746,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         }
         rebuildTabs()
         showActiveDocument()
+        resultsTable.reloadData()
     }
 
     private func startOpening(_ document: EditorDocument) {
@@ -734,6 +770,23 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
 
                 document.byteStore.reset(with: opened.data)
                 document.loadedByteCount = 0
+                if let pending = pendingSearchResultJump,
+                   pending.documentID == documentID,
+                   pending.mode != .text {
+                    if let encoding = opened.encoding {
+                        document.encoding = encoding
+                    }
+                    document.displayMode = pending.mode
+                    document.hasDecodedText = false
+                    document.loadedByteCount = document.fullFileSize
+                    document.loadState = .ready
+                    document.loadSessionID = nil
+                    documentLoadTasks.removeValue(forKey: documentID)
+                    rebuildTabs()
+                    if activeDocument?.id == documentID { showActiveDocument() }
+                    finishPendingSearchResultJump(for: document)
+                    return
+                }
                 if let encoding = opened.encoding {
                     document.encoding = encoding
                     documentLoadTasks.removeValue(forKey: documentID)
@@ -751,6 +804,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                     documentLoadTasks.removeValue(forKey: documentID)
                     rebuildTabs()
                     if activeDocument?.id == documentID { showActiveDocument() }
+                    finishPendingSearchResultJump(for: document)
                 }
             } catch is CancellationError {
             } catch {
@@ -761,6 +815,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                 if activeDocument?.id == documentID {
                     updateStatus(extra: "打开失败：\(error.localizedDescription)")
                 }
+                failPendingSearchResultJump(
+                    for: documentID,
+                    message: "无法重新打开搜索结果：\(error.localizedDescription)"
+                )
             }
         }
     }
@@ -851,6 +909,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                     offset = end
                     document.loadedByteCount = UInt64(end)
                     document.loadState = offset < snapshot.count ? .streaming : .loadingPreview
+                    finishPendingSearchResultJump(for: document)
                     if isFirstChunk {
                         isFirstChunk = false
                         rebuildTabs()
@@ -867,6 +926,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                 textEditorRevisions[documentID] = snapshot.revision
                 documentLoadTasks.removeValue(forKey: documentID)
                 rebuildTabs()
+                finishPendingSearchResultJump(for: document)
                 if activeDocument?.id == documentID { updateStatus(extra: "加载完成") }
             } catch is CancellationError {
             } catch {
@@ -883,12 +943,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                         showActiveDocument()
                         updateStatus(extra: "文本解码失败，已切换Hex")
                     }
+                    finishPendingSearchResultJump(for: document)
                 } else {
                     document.loadState = .failed(error.localizedDescription)
                     rebuildTabs()
                     if activeDocument?.id == documentID {
                         updateStatus(extra: "Text加载失败：\(error.localizedDescription)")
                     }
+                    failPendingSearchResultJump(
+                        for: documentID,
+                        message: "无法定位搜索结果：\(error.localizedDescription)"
+                    )
                 }
             }
         }
@@ -975,6 +1040,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         documentLoadTasks.removeValue(forKey: document.id)?.cancel()
         textEditorRevisions.removeValue(forKey: document.id)
         searchCaches.removeValue(forKey: document.id)
+        if pendingSearchResultJump?.documentID == document.id {
+            pendingSearchResultJump = nil
+        }
         documents.remove(at: index)
         activeIndex = min(index, documents.count - 1)
         if documents.isEmpty {
@@ -984,6 +1052,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
             rebuildTabs()
             showActiveDocument()
         }
+        resultsTable.deselectAll(nil)
+        resultsTable.reloadData()
     }
 
     private func rebuildTabs() {
@@ -1260,7 +1330,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                     headerTitle: title.replacingOccurrences(of: "（正在查找", with: "（已取消"),
                     documentID: nil,
                     mode: nil,
-                    match: nil
+                    match: nil,
+                    source: searchResultItems[index].source
                 )
             }
             resultsTable.reloadData()
@@ -1893,6 +1964,21 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                     if document.isTextLoading { continue }
                     let mode = document.displayMode
                     if mode == .text, !document.hasDecodedText { continue }
+                    let sourceValues: URLResourceValues?
+                    if let fileURL = document.fileURL {
+                        sourceValues = try? fileURL.resourceValues(
+                            forKeys: [.fileSizeKey, .contentModificationDateKey]
+                        )
+                    } else {
+                        sourceValues = nil
+                    }
+                    let resultSource = SearchResultSource(
+                        documentID: document.id,
+                        fileURL: document.fileURL,
+                        fileSize: sourceValues?.fileSize.map { UInt64(max(0, $0)) }
+                            ?? document.fullFileSize,
+                        modificationDate: sourceValues?.contentModificationDate
+                    )
                     let documentLength = documentLengths[document.id] ?? 0
                     let completedBeforeDocument = completedBytes
                     let matchesBeforeDocument = total
@@ -1922,7 +2008,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                                     headerTitle: "\(document.displayName)（正在查找）",
                                     documentID: nil,
                                     mode: nil,
-                                    match: nil
+                                    match: nil,
+                                    source: resultSource
                                 ))
                             }
                             self.searchResultItems.append(contentsOf: batch.map {
@@ -1930,7 +2017,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                                     headerTitle: nil,
                                     documentID: document.id,
                                     mode: mode,
-                                    match: $0
+                                    match: $0,
+                                    source: resultSource
                                 )
                             })
                             displayedMatchCount += batch.count
@@ -1945,7 +2033,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                                 : "\(document.displayName)（正在查找 · 已找到\(displayedMatchCount)项）",
                             documentID: nil,
                             mode: nil,
-                            match: nil
+                            match: nil,
+                            source: resultSource
                         )
                         self.resultsTable.noteNumberOfRowsChanged()
                         self.resultsTable.reloadData(
@@ -2046,17 +2135,152 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         }
     }
 
-    private func jumpToSearchResult(_ item: SearchResultItem) {
-        guard let documentID = item.documentID,
-              let mode = item.mode,
-              let match = item.match,
-              let index = documents.firstIndex(where: { $0.id == documentID }) else { return }
-        let document = documents[index]
+    private func documentIndex(for source: SearchResultSource) -> Int? {
+        if let index = documents.firstIndex(where: { $0.id == source.documentID }) {
+            return index
+        }
+        guard let fileURL = source.fileURL else { return nil }
+        let standardizedURL = fileURL.standardizedFileURL
+        return documents.firstIndex {
+            $0.fileURL?.standardizedFileURL == standardizedURL
+        }
+    }
+
+    private func isSearchResultSourceCurrent(_ source: SearchResultSource) -> Bool {
+        guard let fileURL = source.fileURL,
+              let values = try? fileURL.resourceValues(
+                  forKeys: [.fileSizeKey, .contentModificationDateKey]
+              ),
+              let fileSize = values.fileSize,
+              UInt64(max(0, fileSize)) == source.fileSize else { return false }
+        guard let modificationDate = source.modificationDate else { return true }
+        return values.contentModificationDate == modificationDate
+    }
+
+    private func showSearchResult(
+        _ match: EditorSearchMatch,
+        in document: EditorDocument,
+        at index: Int,
+        mode: EditorDisplayMode
+    ) {
         revealSearchMatch(match, in: document, at: index, mode: mode)
         let location = mode == .text
             ? "行\(match.lineNumber)"
             : String(format: "偏移0x%016llX", UInt64(match.byteRange.location))
         updateStatus(extra: "查找结果 \(location)")
+    }
+
+    private func finishPendingSearchResultJump(for document: EditorDocument) {
+        guard let pending = pendingSearchResultJump,
+              pending.documentID == document.id else { return }
+
+        let end = NSMaxRange(pending.match.byteRange)
+        if pending.mode == .text {
+            guard document.hasDecodedText else {
+                if !document.isTextLoading {
+                    pendingSearchResultJump = nil
+                    updateStatus(extra: "文件无法以Text模式打开，原搜索结果已失效")
+                }
+                return
+            }
+            guard editor(for: document).documentLength >= end else {
+                if !document.isTextLoading {
+                    pendingSearchResultJump = nil
+                    updateStatus(extra: "原搜索位置已超出文件范围，请重新查找")
+                }
+                return
+            }
+        } else {
+            guard document.byteStore.count >= end else {
+                pendingSearchResultJump = nil
+                updateStatus(extra: "原搜索位置已超出文件范围，请重新查找")
+                return
+            }
+        }
+
+        pendingSearchResultJump = nil
+        guard let index = documents.firstIndex(where: { $0.id == document.id }) else { return }
+        showSearchResult(pending.match, in: document, at: index, mode: pending.mode)
+        resultsTable.reloadData()
+    }
+
+    private func failPendingSearchResultJump(for documentID: UUID, message: String) {
+        guard pendingSearchResultJump?.documentID == documentID else { return }
+        pendingSearchResultJump = nil
+        updateStatus(extra: message)
+    }
+
+    private func jumpToSearchResult(_ item: SearchResultItem) {
+        guard let mode = item.mode,
+              let match = item.match else { return }
+        if let documentID = item.documentID,
+           let index = documents.firstIndex(where: { $0.id == documentID }) {
+            showSearchResult(match, in: documents[index], at: index, mode: mode)
+            return
+        }
+        guard let source = item.source,
+              let fileURL = source.fileURL else {
+            updateStatus(extra: "未保存文件关闭后无法重新打开")
+            return
+        }
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            updateStatus(extra: "搜索结果对应的文件已不存在")
+            return
+        }
+        guard isSearchResultSourceCurrent(source) else {
+            updateStatus(extra: "文件内容已变化，原搜索结果已失效，请重新查找")
+            return
+        }
+
+        if documentIndex(for: source) == nil {
+            open(urls: [fileURL])
+        }
+        guard let index = documentIndex(for: source) else {
+            updateStatus(extra: "无法重新打开搜索结果对应的文件")
+            return
+        }
+
+        let document = documents[index]
+        pendingSearchResultJump = PendingSearchResultJump(
+            documentID: document.id,
+            source: source,
+            mode: mode,
+            match: match
+        )
+        activeIndex = index
+        rebuildTabs()
+        showActiveDocument()
+        resultsTable.reloadData()
+        if mode != .text,
+           document.isTextLoading,
+           document.byteStore.count > 0 {
+            documentLoadTasks.removeValue(forKey: document.id)?.cancel()
+            document.loadSessionID = nil
+            document.loadState = .ready
+            document.loadedByteCount = document.fullFileSize
+            document.displayMode = mode
+            document.hasDecodedText = false
+            editors.removeValue(forKey: document.id)?.removeFromSuperview()
+            textEditorRevisions.removeValue(forKey: document.id)
+            finishPendingSearchResultJump(for: document)
+            return
+        }
+        if mode == .text,
+           !document.hasDecodedText,
+           !document.isTextLoading {
+            startProgressiveTextLoad(
+                document,
+                encoding: document.encoding,
+                fallbackToHexOnFailure: false
+            )
+            updateStatus(extra: "正在重新打开并定位搜索结果")
+            return
+        }
+        if document.isTextLoading {
+            updateStatus(extra: "正在重新打开并定位搜索结果")
+        } else {
+            finishPendingSearchResultJump(for: document)
+        }
     }
 
     @objc private func replaceCurrent() {
