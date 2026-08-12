@@ -347,6 +347,16 @@ static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
     return [_scintilla getGeneralProperty:SCI_GETMODIFY] != 0;
 }
 
+- (BOOL)canUndo {
+    return [_scintilla getGeneralProperty:SCI_CANUNDO] != 0;
+}
+
+- (void)undo {
+    if (self.canUndo) {
+        [_scintilla setGeneralProperty:SCI_UNDO value:0];
+    }
+}
+
 - (NSRange)selectedByteRange {
     return _scintilla.selectedRangePositions;
 }

@@ -26,6 +26,7 @@ final class EditorTextView: NSView, @preconcurrency MTEEditorViewDelegate {
     var selectedByteRange: NSRange { editorView.selectedByteRange }
     var selectedString: String { editorView.selectedString }
     var isModified: Bool { editorView.isModified }
+    var canUndo: Bool { editorView.canUndo }
     var documentLength: Int { editorView.documentLength }
 
     func snapshotUTF8Data() -> Data {
@@ -105,6 +106,10 @@ final class EditorTextView: NSView, @preconcurrency MTEEditorViewDelegate {
 
     func setSavePoint() {
         editorView.setSavePoint()
+    }
+
+    func undo() {
+        editorView.undo()
     }
 
     func searchBatch(

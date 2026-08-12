@@ -40,6 +40,7 @@ typedef NS_OPTIONS(NSUInteger, MTEFindOptions) {
 @property(nonatomic, copy, nullable) void (^fileDropHandler)(NSArray<NSURL *> *urls);
 @property(nonatomic, getter=isEditable) BOOL editable;
 @property(nonatomic, readonly, getter=isModified) BOOL modified;
+@property(nonatomic, readonly) BOOL canUndo;
 @property(nonatomic, readonly) NSRange selectedByteRange;
 @property(nonatomic, copy, readonly) NSString *selectedString;
 @property(nonatomic, readonly) NSInteger currentLine;
@@ -81,6 +82,7 @@ typedef NS_OPTIONS(NSUInteger, MTEFindOptions) {
 - (void)addMarkedByteRanges:(NSArray<NSValue *> *)ranges;
 - (void)clearMarkedHighlights;
 - (void)setSavePoint;
+- (void)undo;
 - (void)focusEditor;
 
 @end

@@ -109,6 +109,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         let match: EditorSearchMatch
     }
 
+    private enum ReplacementUndoAction {
+        case text(documentID: UUID)
+        case bytes(documentID: UUID, ranges: [NSRange], original: Data)
+
+        var documentID: UUID {
+            switch self {
+            case .text(let documentID), .bytes(let documentID, _, _):
+                return documentID
+            }
+        }
+    }
+
     private var documents: [EditorDocument] = []
     private var editors: [UUID: EditorTextView] = [:]
     private var byteEditors: [UUID: ByteEditorView] = [:]
@@ -121,8 +133,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     private var searchTask: Task<Void, Never>?
     private var findAllRequestID: UUID?
     private var pendingSearchResultJump: PendingSearchResultJump?
+    private var replacementUndoActions: [ReplacementUndoAction] = []
     private var isFindingAll = false
     private var isReplacingAll = false
+    private var isUndoingReplacement = false
     private var activeIndex = -1
     private var untitledCounter = 1
 
@@ -167,6 +181,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     private let findAllButton = NSButton(title: "查找全部", target: nil, action: nil)
     private let replaceButton = NSButton(title: "替换", target: nil, action: nil)
     private let replaceAllButton = NSButton(title: "全部替换", target: nil, action: nil)
+    private let undoReplaceButton = NSButton(title: "撤销替换", target: nil, action: nil)
     private let markAllButton = NSButton(title: "标记全部", target: nil, action: nil)
     private let clearMarksButton = NSButton(title: "清除标记", target: nil, action: nil)
     private let scopePopup = NSPopUpButton()
@@ -323,6 +338,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         replaceButton.action = #selector(replaceCurrent)
         replaceAllButton.target = self
         replaceAllButton.action = #selector(replaceAll)
+        undoReplaceButton.target = self
+        undoReplaceButton.action = #selector(undoLastReplacement)
+        undoReplaceButton.isEnabled = false
         markAllButton.target = self
         markAllButton.action = #selector(markAll)
         clearMarksButton.target = self
@@ -340,7 +358,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
 
         replaceLabel.alignment = .right
         replaceLabel.widthAnchor.constraint(equalToConstant: 72).isActive = true
-        replaceRow.setViews([replaceLabel, replaceField], in: .leading)
+        replaceRow.setViews([replaceLabel, replaceField, undoReplaceButton], in: .leading)
         replaceRow.orientation = .horizontal
         replaceRow.alignment = .centerY
         replaceRow.spacing = 8
@@ -364,7 +382,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         let scopeRow = NSStackView(views: [
             scopeLabel, scopePopup, flexibleSpace(),
             previousButton, nextButton, findAllButton,
-            replaceButton, replaceAllButton, markAllButton, clearMarksButton
+            replaceButton, replaceAllButton,
+            markAllButton, clearMarksButton
         ])
         scopeRow.orientation = .horizontal
         scopeRow.alignment = .centerY
@@ -455,12 +474,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         let isMarkMode = selectedIndex == 2
         replaceLabel.alphaValue = isReplaceMode ? 1 : 0
         replaceField.alphaValue = isReplaceMode ? 1 : 0
-        replaceField.isEnabled = isReplaceMode && !isFindingAll
+        replaceField.isEnabled = isReplaceMode && !isFindingAll && !isUndoingReplacement
         previousButton.isHidden = isMarkMode
         nextButton.isHidden = isMarkMode
-        findAllButton.isHidden = isReplaceMode || isMarkMode
+        findAllButton.isHidden = isMarkMode
         replaceButton.isHidden = !isReplaceMode
         replaceAllButton.isHidden = !isReplaceMode
+        undoReplaceButton.isHidden = !isReplaceMode
         markAllButton.isHidden = !isMarkMode
         clearMarksButton.isHidden = !isMarkMode
         findPanel.title = isReplaceMode ? "替换" : isMarkMode ? "标记" : "查找"
@@ -468,18 +488,20 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
 
     private func setFindAllRunning(_ running: Bool) {
         isFindingAll = running
-        findField.isEnabled = !running
-        scopePopup.isEnabled = !running
-        caseCheckbox.isEnabled = !running
-        wholeWordCheckbox.isEnabled = !running
-        regexCheckbox.isEnabled = !running
-        previousButton.isEnabled = !running
-        nextButton.isEnabled = !running
-        findAllButton.isEnabled = !running
-        replaceButton.isEnabled = !running && !isReplacingAll
-        replaceAllButton.isEnabled = !running && !isReplacingAll
-        markAllButton.isEnabled = !running
-        clearMarksButton.isEnabled = !running
+        let controlsEnabled = !running && !isUndoingReplacement
+        findField.isEnabled = controlsEnabled
+        scopePopup.isEnabled = controlsEnabled
+        caseCheckbox.isEnabled = controlsEnabled
+        wholeWordCheckbox.isEnabled = controlsEnabled
+        regexCheckbox.isEnabled = controlsEnabled
+        previousButton.isEnabled = controlsEnabled
+        nextButton.isEnabled = controlsEnabled
+        findAllButton.isEnabled = controlsEnabled
+        replaceButton.isEnabled = !running && !isReplacingAll && !isUndoingReplacement
+        replaceAllButton.isEnabled = !running && !isReplacingAll && !isUndoingReplacement
+        updateUndoReplaceButton()
+        markAllButton.isEnabled = controlsEnabled
+        clearMarksButton.isEnabled = controlsEnabled
         findProgress.isHidden = !running
         findSpinner.isHidden = !running
         if running {
@@ -488,6 +510,21 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         } else {
             findSpinner.stopAnimation(nil)
         }
+    }
+
+    private func updateUndoReplaceButton() {
+        undoReplaceButton.isEnabled = !replacementUndoActions.isEmpty
+            && !isFindingAll
+            && !isReplacingAll
+            && !isUndoingReplacement
+    }
+
+    private func invalidateReplacementUndo(for documentID: UUID) {
+        guard replacementUndoActions.contains(where: { $0.documentID == documentID }) else {
+            return
+        }
+        replacementUndoActions.removeAll(keepingCapacity: false)
+        updateUndoReplaceButton()
     }
 
     private func updateFindProgress(
@@ -1078,6 +1115,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         documentLoadTasks.removeValue(forKey: document.id)?.cancel()
         textEditorRevisions.removeValue(forKey: document.id)
         searchCaches.removeValue(forKey: document.id)
+        invalidateReplacementUndo(for: document.id)
         if pendingSearchResultJump?.documentID == document.id {
             pendingSearchResultJump = nil
         }
@@ -1203,11 +1241,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         }
         editor.onTextChanged = { [weak self, weak document, weak editor] in
             guard let self, let document else { return }
-            let becameDirty = !document.isDirty
-            document.isDirty = document.isDirty || (editor?.isModified ?? false)
+            if !self.isUndoingReplacement {
+                self.invalidateReplacementUndo(for: document.id)
+            }
+            let wasDirty = document.isDirty
+            document.isDirty = (editor?.isModified ?? false) || document.byteStore.isModified
             self.searchTask?.cancel()
             self.searchCaches.removeValue(forKey: document.id)
-            if becameDirty, document.isDirty { self.rebuildTabs() }
+            if wasDirty != document.isDirty { self.rebuildTabs() }
         }
         editor.onSelectionChanged = { [weak self] in self?.updateStatus() }
         editor.onFilesDropped = { [weak self] urls in self?.open(urls: urls) }
@@ -1225,7 +1266,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         )
         editor.onBytesChanged = { [weak self, weak document] in
             guard let self, let document else { return }
-            document.isDirty = true
+            if !self.isUndoingReplacement {
+                self.invalidateReplacementUndo(for: document.id)
+            }
+            document.isDirty = document.byteStore.isModified
+                || (self.editors[document.id]?.isModified ?? false)
             self.searchTask?.cancel()
             self.searchCaches.removeValue(forKey: document.id)
             self.rebuildTabs()
@@ -1240,9 +1285,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         guard let document = activeDocument else { return }
         guard !document.isTextLoading else { return }
         if let editor = editors[document.id] {
-            document.isDirty = document.isDirty || editor.isModified || document.byteStore.isModified
-        } else if document.byteStore.isModified {
-            document.isDirty = true
+            document.isDirty = editor.isModified || document.byteStore.isModified
+        } else {
+            document.isDirty = document.byteStore.isModified
         }
     }
 
@@ -1251,6 +1296,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
               let mode = EditorDisplayMode(rawValue: modeControl.selectedSegment) else { return }
         let oldMode = document.displayMode
         guard mode != oldMode else { return }
+        invalidateReplacementUndo(for: document.id)
         do {
             if oldMode == .text, mode != .text, let editor = editors[document.id] {
                 if document.isTextLoading {
@@ -1318,6 +1364,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                 return
             }
         }
+        invalidateReplacementUndo(for: document.id)
         searchCaches.removeValue(forKey: document.id)
         document.isDirty = false
         startProgressiveTextLoad(
@@ -2322,7 +2369,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     }
 
     @objc private func replaceCurrent() {
-        guard !isReplacingAll, !isFindingAll else { return }
+        guard !isReplacingAll, !isFindingAll, !isUndoingReplacement else { return }
         findStatus.textColor = .secondaryLabelColor
         guard let document = activeDocument,
               !document.isReadOnly,
@@ -2339,8 +2386,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                 )
                 let selectedLength = (selectedText as NSString).length
                 if exact.count == 1,
-                   exact[0] == NSRange(location: 0, length: selectedLength) {
+                   exact[0] == NSRange(location: 0, length: selectedLength),
+                   selectedText != replaceField.stringValue {
                     editor.replaceSelection(with: replaceField.stringValue)
+                    replacementUndoActions = [.text(documentID: document.id)]
+                    updateUndoReplaceButton()
                 }
                 startDirectionalFind(direction: 1)
                 return
@@ -2354,7 +2404,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
             let editor = byteEditor(for: document)
             let selected = editor.selectedByteRange
             if selected.length == query.count,
-               document.byteStore.data(in: selected.location..<NSMaxRange(selected)) == query {
+               document.byteStore.data(in: selected.location..<NSMaxRange(selected)) == query,
+               query != replacement {
                 try document.byteStore.replaceBytes(
                     in: selected.location..<NSMaxRange(selected),
                     with: replacement
@@ -2362,6 +2413,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                 document.isDirty = true
                 editor.reloadData()
                 searchCaches.removeValue(forKey: document.id)
+                replacementUndoActions = [.bytes(
+                    documentID: document.id,
+                    ranges: [selected],
+                    original: query
+                )]
+                updateUndoReplaceButton()
                 startDirectionalFind(direction: 1)
             } else {
                 startDirectionalFind(direction: 1)
@@ -2372,7 +2429,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     }
 
     @objc private func replaceAll() {
-        guard !isReplacingAll, !isFindingAll else { return }
+        guard !isReplacingAll, !isFindingAll, !isUndoingReplacement else { return }
         findStatus.textColor = .secondaryLabelColor
         let indexes = scopePopup.indexOfSelectedItem == 0
             ? [activeIndex]
@@ -2388,13 +2445,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
         isReplacingAll = true
         replaceButton.isEnabled = false
         replaceAllButton.isEnabled = false
+        updateUndoReplaceButton()
         findStatus.stringValue = "正在准备后台替换…"
         searchTask = Task { [weak self] in
             guard let self else { return }
+            var undoActions: [ReplacementUndoAction] = []
             defer {
                 isReplacingAll = false
                 replaceButton.isEnabled = true
                 replaceAllButton.isEnabled = true
+                if !undoActions.isEmpty {
+                    replacementUndoActions = undoActions
+                }
+                updateUndoReplaceButton()
             }
             var total = 0
             do {
@@ -2460,6 +2523,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                         total += result.count
                         document.isDirty = true
                         textEditorRevisions.removeValue(forKey: document.id)
+                        undoActions.append(.text(documentID: document.id))
                     } else {
                         let query = try byteQuery(from: queryText, mode: document.displayMode)
                         let replacement = try byteQuery(from: replacementText, mode: document.displayMode)
@@ -2488,6 +2552,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                             document.isDirty = true
                             byteEditor(for: document).reloadData()
                             byteEditor(for: document).clearSearchHighlights()
+                            undoActions.append(.bytes(
+                                documentID: document.id,
+                                ranges: matches.map(\.byteRange),
+                                original: query
+                            ))
                         }
                     }
                     searchCaches.removeValue(forKey: document.id)
@@ -2503,6 +2572,94 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                 findStatus.stringValue = "已取消替换"
             } catch {
                 findStatus.stringValue = error.localizedDescription
+            }
+        }
+    }
+
+    @objc private func undoLastReplacement() {
+        guard !isReplacingAll,
+              !isFindingAll,
+              !isUndoingReplacement,
+              !replacementUndoActions.isEmpty else { return }
+
+        let actions = replacementUndoActions
+        for action in actions {
+            guard let document = documents.first(where: { $0.id == action.documentID }) else {
+                replacementUndoActions.removeAll(keepingCapacity: false)
+                updateUndoReplaceButton()
+                findStatus.stringValue = "无法撤销：相关文件已关闭"
+                return
+            }
+            switch action {
+            case .text:
+                guard editors[document.id]?.canUndo == true else {
+                    replacementUndoActions.removeAll(keepingCapacity: false)
+                    updateUndoReplaceButton()
+                    findStatus.stringValue = "无法撤销：文档撤销记录已失效"
+                    return
+                }
+            case .bytes(_, let ranges, _):
+                guard ranges.allSatisfy({
+                    $0.location >= 0 && NSMaxRange($0) <= document.byteStore.count
+                }) else {
+                    replacementUndoActions.removeAll(keepingCapacity: false)
+                    updateUndoReplaceButton()
+                    findStatus.stringValue = "无法撤销：字节位置已失效"
+                    return
+                }
+            }
+        }
+
+        replacementUndoActions.removeAll(keepingCapacity: false)
+        searchTask?.cancel()
+        isUndoingReplacement = true
+        replaceField.isEnabled = false
+        setFindAllRunning(false)
+        findStatus.textColor = .secondaryLabelColor
+        findStatus.stringValue = "正在撤销上次替换…"
+
+        Task { [weak self] in
+            guard let self else { return }
+            defer {
+                isUndoingReplacement = false
+                setFindAllRunning(false)
+                updateFindPanelMode()
+                rebuildTabs()
+                showActiveDocument()
+            }
+            do {
+                for action in actions.reversed() {
+                    guard let document = documents.first(where: { $0.id == action.documentID }) else {
+                        continue
+                    }
+                    switch action {
+                    case .text:
+                        let documentEditor = editor(for: document)
+                        documentEditor.undo()
+                        document.isDirty = documentEditor.isModified
+                            || document.byteStore.isModified
+                        textEditorRevisions.removeValue(forKey: document.id)
+                    case .bytes(_, let ranges, let original):
+                        for (index, range) in ranges.reversed().enumerated() {
+                            try document.byteStore.replaceBytes(
+                                in: range.location..<NSMaxRange(range),
+                                with: original
+                            )
+                            if index.isMultiple(of: searchBatchMatchCount) {
+                                await Task.yield()
+                            }
+                        }
+                        document.isDirty = document.byteStore.isModified
+                            || (editors[document.id]?.isModified ?? false)
+                        byteEditors[document.id]?.reloadData()
+                        byteEditors[document.id]?.clearSearchHighlights()
+                    }
+                    searchCaches.removeValue(forKey: document.id)
+                }
+                findStatus.stringValue = "已撤销上次替换，尚未保存到磁盘"
+            } catch {
+                findStatus.textColor = .systemRed
+                findStatus.stringValue = "撤销替换失败：\(error.localizedDescription)"
             }
         }
     }
