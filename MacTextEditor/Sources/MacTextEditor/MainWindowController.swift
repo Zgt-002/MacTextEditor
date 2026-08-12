@@ -1239,8 +1239,35 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     }
 
     @objc private func closeFindPanel() {
+        guard shouldCloseFindPanel() else { return }
         findPanel.orderOut(nil)
+    }
+
+    private func shouldCloseFindPanel() -> Bool {
+        if isReplacingAll {
+            let alert = NSAlert()
+            alert.messageText = "全部替换正在进行"
+            alert.informativeText = "停止后，当前文件会在安全处理完成后停止，已经完成的替换不会自动撤销。"
+            alert.addButton(withTitle: "继续替换")
+            alert.addButton(withTitle: "停止替换并关闭")
+            guard alert.runModal() == .alertSecondButtonReturn else { return false }
+        }
+        if isFindingAll {
+            for index in searchResultItems.indices {
+                guard let title = searchResultItems[index].headerTitle,
+                      title.contains("（正在查找") else { continue }
+                searchResultItems[index] = SearchResultItem(
+                    headerTitle: title.replacingOccurrences(of: "（正在查找", with: "（已取消"),
+                    documentID: nil,
+                    mode: nil,
+                    match: nil
+                )
+            }
+            resultsTable.reloadData()
+        }
+        searchTask?.cancel()
         window?.makeKeyAndOrderFront(nil)
+        return true
     }
 
     private var searchOptions: SearchOptions {
@@ -1339,8 +1366,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                     }
 
                     let initialPosition = direction > 0 ? NSMaxRange(selected) : selected.location
-                    let match: EditorSearchMatch?
-                    let matches: [EditorSearchMatch]
                     if mode == .text {
                         let documentEditor = editor(for: document)
                         documentEditor.clearSearchHighlights()
@@ -1360,17 +1385,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                                 direction: direction
                             )
                         }
-                        match = found
                         if let found {
                             revealSearchMatch(found, in: document, at: index, mode: mode)
-                            findStatus.stringValue = "已找到，正在统计…"
-                            matches = try await collectMatches(
-                                in: documentEditor,
-                                query: query,
-                                options: options
-                            )
-                        } else {
-                            matches = []
+                            findStatus.stringValue = "已找到"
+                            return
                         }
                     } else {
                         let bytes = try byteQuery(from: query, mode: mode)
@@ -1392,31 +1410,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                                 direction: direction
                             )
                         }
-                        match = found
                         if let found {
                             revealSearchMatch(found, in: document, at: index, mode: mode)
-                            findStatus.stringValue = "已找到，正在统计…"
-                            matches = try await collectByteMatches(
-                                in: document,
-                                bytes: bytes,
-                                mode: mode
-                            )
-                            documentEditor.setSearchHighlights(matches.map(\.byteRange))
-                        } else {
-                            matches = []
+                            findStatus.stringValue = "已找到"
+                            return
                         }
-                    }
-                    if let match {
-                        searchCaches[document.id] = SearchCache(
-                            query: query,
-                            options: options,
-                            mode: mode,
-                            matches: matches
-                        )
-                        if let position = matches.firstIndex(of: match) {
-                            findStatus.stringValue = "第\(position + 1)/\(matches.count)项"
-                        }
-                        return
                     }
                 }
                 findStatus.stringValue = "未找到"
@@ -2231,12 +2229,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
                         }
                     }
                     searchCaches.removeValue(forKey: document.id)
+                    try Task.checkCancellation()
                     await Task.yield()
                 }
                 rebuildTabs()
                 showActiveDocument()
                 findStatus.stringValue = "已替换\(total)项，尚未保存到磁盘"
             } catch is CancellationError {
+                rebuildTabs()
+                showActiveDocument()
                 findStatus.stringValue = "已取消替换"
             } catch {
                 findStatus.stringValue = error.localizedDescription
@@ -2300,6 +2301,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSearch
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if sender === findPanel {
+            guard shouldCloseFindPanel() else { return false }
+            findPanel.orderOut(nil)
+            return false
+        }
         syncActiveDocument()
         let dirty = documents.filter(\.isDirty)
         guard !dirty.isEmpty else { return true }
