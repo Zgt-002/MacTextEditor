@@ -16,7 +16,10 @@ swiftc \
     "$ROOT_DIR/Sources/MacTextEditor/Core.swift" \
     "$ROOT_DIR/Sources/MacTextEditor/ByteStore.swift" \
     "$ROOT_DIR/Sources/MacTextEditor/IncrementalTextDecoder.swift" \
+    "$ROOT_DIR/Sources/MacTextEditor/SmartHighlight.swift" \
+    "$ROOT_DIR/Sources/MacTextEditor/SmartHighlightCache.swift" \
     "$ROOT_DIR/Sources/MacTextEditor/EditorDocument.swift" \
+    "$ROOT_DIR/Tests/SmartHighlightCacheTests.swift" \
     "$ROOT_DIR/Tests/CoreTests.swift" \
     -framework AppKit \
     -o "$TEST_BINARY"

@@ -19,7 +19,7 @@ private func expect(_ condition: @autoclosure () -> Bool, _ message: String) thr
 @main
 struct CoreTests {
     @MainActor
-    static func main() throws {
+    static func main() async throws {
         try testChineseUTF8RoundTrip()
         try testIncompleteUTF8Preview()
         try testGB18030RoundTrip()
@@ -29,6 +29,11 @@ struct CoreTests {
         try testBinaryFileCanBeEditedAndSaved()
         try testByteStoreChunkBoundarySearch()
         try testByteStoreRevision()
+        try testSmartHighlightChunkBoundaries()
+        try testSmartHighlightBatchPagination()
+        try testSmartHighlightBinarySliceAndEOF()
+        try await testSmartHighlightCancellation()
+        try runSmartHighlightCacheTests()
         try testIncrementalUTF8ChineseBoundary()
         try testBinaryDetectionBeyondPrefix()
         try testLargeFilePolicy()
@@ -165,6 +170,108 @@ struct CoreTests {
         try store.replaceByte(at: 0, with: 0x5A)
         try expect(store.revision == initialRevision + 1, "Byte edit did not change the revision")
         try expect(store.materializedData() == Data([0x5A, 0x42]), "Byte materialization lost an edit")
+    }
+
+    private static func scanSmartHighlights(_ source: Data, query: Data, chunkSize: Int) throws -> [NSRange] {
+        var ranges: [NSRange] = []
+        var nextPosition = 0
+        var chunkStart = 0
+        while chunkStart < source.count {
+            let boundary = min(source.count, chunkStart + chunkSize)
+            let readEnd = min(source.count, boundary + query.count - 1)
+            let data = source.subdata(in: chunkStart..<readEnd)
+            var batch: SmartHighlightBatch
+            repeat {
+                batch = try SmartHighlightMatcher.scan(
+                    data: data,
+                    baseOffset: chunkStart,
+                    searchRange: NSRange(location: chunkStart, length: boundary - chunkStart),
+                    query: query,
+                    fromPosition: nextPosition,
+                    maximumCount: 2
+                )
+                ranges.append(contentsOf: batch.ranges)
+                nextPosition = batch.nextPosition
+            } while !batch.isFinished
+            chunkStart = boundary
+        }
+        return ranges
+    }
+
+    private static func testSmartHighlightChunkBoundaries() throws {
+        let chinese = Data("x中文y中文z".utf8)
+        let query = Data("中文".utf8)
+        for chunkSize in 1...9 {
+            let ranges = try scanSmartHighlights(chinese, query: query, chunkSize: chunkSize)
+            try expect(ranges == [NSRange(location: 1, length: 6), NSRange(location: 8, length: 6)],
+                       "Smart highlighting missed a Chinese UTF-8 chunk-boundary match")
+        }
+        for chunkSize in 1...6 {
+            let ranges = try scanSmartHighlights(Data("aaaaaaaaaa".utf8), query: Data("aaa".utf8), chunkSize: chunkSize)
+            try expect(ranges == [NSRange(location: 0, length: 3), NSRange(location: 3, length: 3), NSRange(location: 6, length: 3)],
+                       "Smart highlighting duplicated an overlapping cross-chunk match")
+        }
+        let short = try scanSmartHighlights(Data("aaaa".utf8), query: Data("aaa".utf8), chunkSize: 2)
+        try expect(short == [NSRange(location: 0, length: 3)], "Smart highlighting duplicated the aaa/aaaa boundary match")
+    }
+
+    private static func testSmartHighlightBatchPagination() throws {
+        let data = Data(repeating: 0x61, count: 1025)
+        let range = NSRange(location: 100, length: data.count)
+        let first = try SmartHighlightMatcher.scan(data: data, baseOffset: 100, searchRange: range,
+                                                  query: Data([0x61]), fromPosition: 100)
+        try expect(first.ranges.count == 512 && first.nextPosition == 612 && !first.isFinished,
+                   "Smart highlighting did not stop at the first 512-match batch")
+        let second = try SmartHighlightMatcher.scan(data: data, baseOffset: 100, searchRange: range,
+                                                   query: Data([0x61]), fromPosition: first.nextPosition)
+        try expect(second.ranges.count == 512 && second.nextPosition == 1124 && !second.isFinished,
+                   "Smart highlighting did not continue the second batch")
+        let third = try SmartHighlightMatcher.scan(data: data, baseOffset: 100, searchRange: range,
+                                                  query: Data([0x61]), fromPosition: second.nextPosition)
+        try expect(third.ranges == [NSRange(location: 1124, length: 1)] && third.nextPosition == 1125 && third.isFinished,
+                   "Smart highlighting did not finish the last batch")
+    }
+
+    private static func testSmartHighlightBinarySliceAndEOF() throws {
+        let original = Data([0xFF, 0xEE, 0x00, 0xAB, 0x00, 0xAB, 0x00])
+        let slice = original[2...]
+        try expect(slice.startIndex != 0, "Smart highlighting slice test must use a nonzero Data start index")
+        let query = Data([0x00, 0xAB])
+        let batch = try SmartHighlightMatcher.scan(data: slice, baseOffset: 200,
+                                                  searchRange: NSRange(location: 200, length: slice.count),
+                                                  query: query, fromPosition: 200)
+        try expect(batch.ranges == [NSRange(location: 200, length: 2), NSRange(location: 202, length: 2)]
+                   && batch.nextPosition == 205 && batch.isFinished,
+                   "Smart highlighting mishandled binary NUL bytes, sliced Data, or the EOF suffix")
+        let beyond = try SmartHighlightMatcher.scan(data: Data([0x41, 0x00, 0xAB]), baseOffset: 10,
+                                                   searchRange: NSRange(location: 10, length: 1),
+                                                   query: query, fromPosition: 10)
+        try expect(beyond.ranges.isEmpty && beyond.nextPosition == 11 && beyond.isFinished,
+                   "Smart highlighting accepted a match starting outside the owned range")
+        let crossed = try SmartHighlightMatcher.scan(data: Data("aaa".utf8), baseOffset: 0,
+                                                    searchRange: NSRange(location: 0, length: 1),
+                                                    query: Data("aaa".utf8), fromPosition: 0)
+        try expect(crossed.nextPosition == 3 && crossed.isFinished,
+                   "Smart highlighting truncated a cross-boundary match end")
+        let empty = try SmartHighlightMatcher.scan(data: Data(), baseOffset: 5,
+                                                  searchRange: NSRange(location: 5, length: 0),
+                                                  query: query, fromPosition: 8)
+        try expect(empty.ranges.isEmpty && empty.nextPosition == 8 && empty.isFinished,
+                   "Smart highlighting moved the next allowed match position backward at EOF")
+    }
+
+    private static func testSmartHighlightCancellation() async throws {
+        let task = Task.detached {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try SmartHighlightMatcher.scan(data: Data("abc".utf8), baseOffset: 0,
+                                                  searchRange: NSRange(location: 0, length: 3),
+                                                  query: Data("a".utf8), fromPosition: 0)
+        }
+        do {
+            _ = try await task.value
+            throw TestFailure.failed("Cancelled smart highlighting continued scanning")
+        } catch is CancellationError {
+        }
     }
 
     private static func testIncrementalUTF8ChineseBoundary() throws {

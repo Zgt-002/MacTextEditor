@@ -17,10 +17,12 @@ struct EditorSearchBatch {
 final class EditorTextView: NSView, @preconcurrency MTEEditorViewDelegate {
     private let editorView = MTEEditorView()
     private var selectionChangePending = false
+    private var viewportChangePending = false
     private(set) var isIncrementallyLoading = false
     private(set) var contentRevision = 0
     var onTextChanged: (() -> Void)?
     var onSelectionChanged: (() -> Void)?
+    var onViewportChanged: (() -> Void)?
     var onFilesDropped: (([URL]) -> Void)?
     var onEscape: (() -> Bool)?
 
@@ -34,6 +36,14 @@ final class EditorTextView: NSView, @preconcurrency MTEEditorViewDelegate {
 
     func snapshotUTF8Data() -> Data {
         editorView.utf8Data
+    }
+
+    func copyUTF8Bytes(in range: NSRange) -> Data {
+        editorView.copyUTF8Bytes(in: range)
+    }
+
+    func smartHighlightByteRanges(extraScreens: Int) -> [NSRange] {
+        editorView.smartHighlightByteRanges(extraScreens: extraScreens).map(\.rangeValue)
     }
 
     func setEditable(_ editable: Bool) {
@@ -155,32 +165,20 @@ final class EditorTextView: NSView, @preconcurrency MTEEditorViewDelegate {
         editorView.clearSearchHighlights()
     }
 
-    func smartHighlightBatch(
-        query: String,
-        fromPosition: Int,
-        byteLimit: Int,
-        maximumCount: Int
-    ) throws -> EditorSearchBatch {
-        var searchError: NSError?
-        let batch = editorView.smartHighlightOccurrences(
-            of: query,
-            fromPosition: fromPosition,
-            byteLimit: byteLimit,
-            maximumCount: maximumCount,
-            error: &searchError
-        )
-        if let searchError { throw searchError }
-        return EditorSearchBatch(
-            matches: batch.matches.map {
-                EditorSearchMatch(
-                    byteRange: $0.byteRange,
-                    lineNumber: $0.lineNumber,
-                    lineText: $0.lineText
-                )
-            },
-            nextPosition: batch.nextPosition,
-            isFinished: batch.isFinished
-        )
+    func setVisibleSmartHighlights(_ ranges: [NSRange]) {
+        editorView.setVisibleSmartByteRanges(ranges.map(NSValue.init(range:)))
+    }
+
+    func addVisibleSmartHighlights(_ ranges: [NSRange]) {
+        editorView.addVisibleSmartByteRanges(ranges.map(NSValue.init(range:)))
+    }
+
+    func addFullSmartHighlights(_ ranges: [NSRange]) {
+        editorView.addFullSmartByteRanges(ranges.map(NSValue.init(range:)))
+    }
+
+    func clearFullSmartHighlights() {
+        editorView.clearFullSmartHighlights()
     }
 
     func clearSmartHighlights() {
@@ -240,6 +238,16 @@ final class EditorTextView: NSView, @preconcurrency MTEEditorViewDelegate {
             guard let self else { return }
             self.selectionChangePending = false
             self.onSelectionChanged?()
+        }
+    }
+
+    func editorViewViewportDidChange(_ editorView: MTEEditorView) {
+        guard !viewportChangePending else { return }
+        viewportChangePending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.viewportChangePending = false
+            self.onViewportChanged?()
         }
     }
 

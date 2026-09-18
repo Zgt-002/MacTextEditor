@@ -79,12 +79,14 @@ typedef NS_OPTIONS(NSUInteger, MTEFindOptions) {
                                           byteLimit:(NSInteger)byteLimit
                                        maximumCount:(NSInteger)maximumCount
                                               error:(NSError **)error;
-- (MTEEditorSearchBatch *)smartHighlightOccurrencesOfString:(NSString *)query
-                                               fromPosition:(NSInteger)fromPosition
-                                                  byteLimit:(NSInteger)byteLimit
-                                               maximumCount:(NSInteger)maximumCount
-                                                      error:(NSError **)error
-    NS_SWIFT_NAME(smartHighlightOccurrences(of:fromPosition:byteLimit:maximumCount:error:));
+- (NSData *)copyUTF8BytesInRange:(NSRange)range
+    NS_SWIFT_NAME(copyUTF8Bytes(in:));
+- (NSArray<NSValue *> *)smartHighlightByteRangesWithExtraScreens:(NSInteger)extraScreens
+    NS_SWIFT_NAME(smartHighlightByteRanges(extraScreens:));
+- (void)setVisibleSmartByteRanges:(NSArray<NSValue *> *)ranges;
+- (void)addVisibleSmartByteRanges:(NSArray<NSValue *> *)ranges;
+- (void)addFullSmartByteRanges:(NSArray<NSValue *> *)ranges;
+- (void)clearFullSmartHighlights;
 - (void)selectAndRevealByteRange:(NSRange)range;
 - (void)clearSearchHighlights;
 - (void)clearSmartHighlights;
@@ -100,6 +102,7 @@ typedef NS_OPTIONS(NSUInteger, MTEFindOptions) {
 
 - (void)editorViewContentDidChange:(MTEEditorView *)editorView;
 - (void)editorViewSelectionDidChange:(MTEEditorView *)editorView;
+- (void)editorViewViewportDidChange:(MTEEditorView *)editorView;
 
 @end
 

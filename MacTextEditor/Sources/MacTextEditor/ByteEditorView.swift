@@ -27,14 +27,17 @@ final class ByteEditorView: NSView {
     }
 
     var selectedByteRange: NSRange { contentView.selectedByteRange }
-    var visibleByteRange: NSRange {
+    var visibleByteRange: NSRange { smartHighlightByteRange(extraScreens: 2) }
+
+    func smartHighlightByteRange(extraScreens: Int) -> NSRange {
         let visibleRect = scrollView.documentVisibleRect
         let visibleRows = max(1, Int(ceil(visibleRect.height / contentView.lineHeight)))
         let firstVisibleRow = max(0, Int(floor(visibleRect.minY / contentView.lineHeight)))
-        let firstRow = max(0, firstVisibleRow - visibleRows * 2)
+        let padding = max(0, extraScreens)
+        let firstRow = max(0, firstVisibleRow - visibleRows * padding)
         let lastRow = min(
             (contentView.store.count + contentView.bytesPerRow - 1) / contentView.bytesPerRow,
-            firstVisibleRow + visibleRows * 3
+            firstVisibleRow + visibleRows * (padding + 1)
         )
         let start = min(contentView.store.count, firstRow * contentView.bytesPerRow)
         let end = min(contentView.store.count, lastRow * contentView.bytesPerRow)
@@ -89,6 +92,7 @@ final class ByteEditorView: NSView {
     override func layout() {
         super.layout()
         updateDocumentSize()
+        onViewportChanged?()
     }
 
     func reloadData() {
@@ -119,10 +123,39 @@ final class ByteEditorView: NSView {
     }
 
     func setVisibleSmartHighlights(_ ranges: [NSRange]) {
-        contentView.visibleSmartHighlights = ranges.sorted { $0.location < $1.location }
+        let sorted = ranges.sorted { $0.location < $1.location }
+        if contentView.visibleSmartHighlights != sorted {
+            contentView.visibleSmartHighlights = sorted
+        }
+    }
+
+    func addVisibleSmartHighlights(_ ranges: [NSRange]) {
+        guard !ranges.isEmpty else { return }
+        let existing = contentView.visibleSmartHighlights
+        if existing.last.map({ $0.location < ranges[0].location }) ?? true {
+            contentView.visibleSmartHighlights.append(contentsOf: ranges)
+            return
+        }
+        var merged: [NSRange] = []
+        merged.reserveCapacity(existing.count + ranges.count)
+        var left = 0
+        var right = 0
+        while left < existing.count || right < ranges.count {
+            let next: NSRange
+            if right == ranges.count || (left < existing.count && existing[left].location <= ranges[right].location) {
+                next = existing[left]
+                left += 1
+            } else {
+                next = ranges[right]
+                right += 1
+            }
+            if merged.last != next { merged.append(next) }
+        }
+        contentView.visibleSmartHighlights = merged
     }
 
     func addSmartHighlights(_ ranges: [NSRange]) {
+        guard !ranges.isEmpty else { return }
         contentView.smartHighlights.append(contentsOf: ranges)
     }
 

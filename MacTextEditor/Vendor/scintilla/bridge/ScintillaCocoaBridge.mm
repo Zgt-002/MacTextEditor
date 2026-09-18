@@ -3,14 +3,59 @@
 #import "Scintilla.h"
 #import "ScintillaView.h"
 
+#include <algorithm>
+#include <iterator>
+#include <vector>
+
 static NSString *const MTEEditorErrorDomain = @"MacTextEditor.Scintilla";
 static const int MTESearchIndicator = 8;
 static const int MTEMarkIndicator = 9;
 static const int MTESmartHighlightIndicator = 10;
+static const int MTEVisibleSmartHighlightIndicator = 11;
 static const int MTELineNumberMargin = 0;
 static const int MTELineNumberPaddingMargin = 1;
 static const int MTESeparatorMargin = 2;
 static const long MTEMinimumLineNumberMarginWidth = 32;
+
+static std::vector<NSRange> MTEMergedRanges(std::vector<NSRange> ranges) {
+    std::sort(ranges.begin(), ranges.end(), [](NSRange left, NSRange right) {
+        return left.location < right.location;
+    });
+    std::vector<NSRange> merged;
+    for (NSRange range : ranges) {
+        if (range.length == 0)
+            continue;
+        if (!merged.empty() && range.location <= NSMaxRange(merged.back())) {
+            merged.back().length = MAX(NSMaxRange(merged.back()), NSMaxRange(range)) - merged.back().location;
+        } else {
+            merged.push_back(range);
+        }
+    }
+    return merged;
+}
+
+static std::vector<NSRange> MTERangeDifference(const std::vector<NSRange> &ranges,
+                                             const std::vector<NSRange> &removed) {
+    std::vector<NSRange> result;
+    size_t removedIndex = 0;
+    for (NSRange range : ranges) {
+        NSUInteger cursor = range.location;
+        const NSUInteger end = NSMaxRange(range);
+        while (removedIndex < removed.size() && NSMaxRange(removed[removedIndex]) <= cursor)
+            removedIndex++;
+        size_t index = removedIndex;
+        while (index < removed.size() && removed[index].location < end) {
+            const NSRange overlap = removed[index];
+            if (overlap.location > cursor)
+                result.push_back(NSMakeRange(cursor, overlap.location - cursor));
+            cursor = MAX(cursor, MIN(end, NSMaxRange(overlap)));
+            index++;
+        }
+        if (cursor < end)
+            result.push_back(NSMakeRange(cursor, end - cursor));
+    }
+    return result;
+}
 
 static long MTEColorValue(NSColor *color) {
     NSColor *deviceColor = [color colorUsingColorSpace:NSColorSpace.deviceRGBColorSpace];
@@ -132,7 +177,9 @@ static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
 @property(nonatomic) BOOL incrementalLoadEditable;
 @end
 
-@implementation MTEEditorView
+@implementation MTEEditorView {
+    std::vector<NSRange> _visibleSmartRanges;
+}
 
 - (instancetype)initWithFrame:(NSRect)frameRect {
     self = [super initWithFrame:frameRect];
@@ -159,6 +206,15 @@ static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
         [self configureEditor];
     }
     return self;
+}
+
+- (void)setFrameSize:(NSSize)newSize {
+    const BOOL changed = !NSEqualSizes(self.frame.size, newSize);
+    [super setFrameSize:newSize];
+    if (changed && _scintilla) {
+        [self updateLineNumberMarginWidth];
+        [self.delegate editorViewViewportDidChange:self];
+    }
 }
 
 - (void)configureEditor {
@@ -200,6 +256,10 @@ static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
     [_scintilla setColorProperty:SCI_INDICSETFORE parameter:MTESmartHighlightIndicator value:NSColor.systemGreenColor];
     [_scintilla setGeneralProperty:SCI_INDICSETALPHA parameter:MTESmartHighlightIndicator value:75];
     [_scintilla setGeneralProperty:SCI_INDICSETUNDER parameter:MTESmartHighlightIndicator value:1];
+    [_scintilla setGeneralProperty:SCI_INDICSETSTYLE parameter:MTEVisibleSmartHighlightIndicator value:INDIC_ROUNDBOX];
+    [_scintilla setColorProperty:SCI_INDICSETFORE parameter:MTEVisibleSmartHighlightIndicator value:NSColor.systemGreenColor];
+    [_scintilla setGeneralProperty:SCI_INDICSETALPHA parameter:MTEVisibleSmartHighlightIndicator value:75];
+    [_scintilla setGeneralProperty:SCI_INDICSETUNDER parameter:MTEVisibleSmartHighlightIndicator value:1];
     [self updateLineNumberMarginWidth];
 }
 
@@ -362,6 +422,23 @@ static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
     return data;
 }
 
+- (NSData *)copyUTF8BytesInRange:(NSRange)range {
+    const NSUInteger documentLength = self.documentLength;
+    if (range.location >= documentLength || range.length == 0)
+        return [NSData data];
+    const NSUInteger length = MIN(range.length, documentLength - range.location);
+    NSMutableData *data = [NSMutableData dataWithLength:length + 1];
+    Sci_TextRangeFull textRange = {
+        {static_cast<Sci_Position>(range.location), static_cast<Sci_Position>(range.location + length)},
+        static_cast<char *>(data.mutableBytes)
+    };
+    [_scintilla message:SCI_GETTEXTRANGEFULL
+                 wParam:0
+                 lParam:reinterpret_cast<sptr_t>(&textRange)];
+    data.length = length;
+    return data;
+}
+
 - (BOOL)isEditable {
     return _scintilla.isEditable;
 }
@@ -403,6 +480,65 @@ static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
     if (end < 0 || end > documentLength)
         end = documentLength;
     return NSMakeRange(start, MAX(0, end - start));
+}
+
+- (NSArray<NSValue *> *)smartHighlightByteRangesWithExtraScreens:(NSInteger)extraScreens {
+    const long documentLength = self.documentLength;
+    if (documentLength == 0)
+        return @[];
+    const long extra = MAX(0, extraScreens);
+    const long firstVisibleLine = [_scintilla getGeneralProperty:SCI_GETFIRSTVISIBLELINE];
+    const long linesOnScreen = MAX(1, [_scintilla getGeneralProperty:SCI_LINESONSCREEN]);
+    const long lineCount = [_scintilla getGeneralProperty:SCI_GETLINECOUNT];
+    const long firstLine = MAX(0, firstVisibleLine - linesOnScreen * extra);
+    const long lastLine = MIN(lineCount - 1, firstVisibleLine + linesOnScreen * (extra + 1));
+    if (firstLine > lastLine)
+        return @[];
+    if (extra > 2) {
+        // 缓存保留范围只查行索引，不为离屏的二十一屏内容执行排版。
+        const long firstDocumentLine = [_scintilla getGeneralProperty:SCI_DOCLINEFROMVISIBLE parameter:firstLine];
+        const long lastDocumentLine = [_scintilla getGeneralProperty:SCI_DOCLINEFROMVISIBLE parameter:lastLine];
+        const long start = [_scintilla getGeneralProperty:SCI_POSITIONFROMLINE parameter:firstDocumentLine];
+        long end = [_scintilla getGeneralProperty:SCI_POSITIONFROMLINE parameter:lastDocumentLine + 1];
+        if (end < 0)
+            end = documentLength;
+        return end > start ? @[[NSValue valueWithRange:NSMakeRange(start, end - start)]] : @[];
+    }
+    const NSRect viewport = _scintilla.content.enclosingScrollView.contentView.bounds;
+    const long lineHeight = MAX(1, [_scintilla getGeneralProperty:SCI_TEXTHEIGHT parameter:0]);
+    const long textLeft = [_scintilla getGeneralProperty:SCI_GETMARGINLEFT];
+    const long width = MAX(1, static_cast<long>(viewport.size.width) - textLeft);
+    std::vector<NSRange> ranges;
+    for (long visibleLine = firstLine; visibleLine <= lastLine; visibleLine++) {
+        const long line = [_scintilla getGeneralProperty:SCI_DOCLINEFROMVISIBLE parameter:visibleLine];
+        const long lineStart = [_scintilla getGeneralProperty:SCI_POSITIONFROMLINE parameter:line];
+        long lineEnd = [_scintilla getGeneralProperty:SCI_POSITIONFROMLINE parameter:line + 1];
+        if (lineEnd < 0)
+            lineEnd = documentLength;
+        long start = lineStart;
+        long end = lineEnd;
+        if (lineEnd - lineStart > 64 * 1024) {
+            // 离屏超长行等进入视口后再扫描，避免预取触发整行同步排版。
+            if (visibleLine < firstVisibleLine || visibleLine > firstVisibleLine + linesOnScreen)
+                continue;
+            // 长行只取水平视口附近的字节，不让最初选区决定后续滚动的扫描位置。
+            const long y = static_cast<long>(visibleLine * lineHeight - viewport.origin.y + lineHeight / 2);
+            start = [_scintilla message:SCI_POSITIONFROMPOINT
+                                 wParam:static_cast<uptr_t>(textLeft - width * extra)
+                                 lParam:y];
+            end = [_scintilla message:SCI_POSITIONFROMPOINT
+                               wParam:textLeft + width * (extra + 1)
+                               lParam:y];
+            start = MAX(lineStart, MIN(lineEnd, start));
+            end = MAX(start, MIN(lineEnd, end + 1));
+        }
+        if (end > start)
+            ranges.push_back(NSMakeRange(start, end - start));
+    }
+    NSMutableArray<NSValue *> *result = [NSMutableArray array];
+    for (NSRange range : MTEMergedRanges(std::move(ranges)))
+        [result addObject:[NSValue valueWithRange:range]];
+    return result;
 }
 
 - (NSInteger)currentLine {
@@ -572,76 +708,6 @@ static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
     return converted;
 }
 
-- (MTEEditorSearchBatch *)smartHighlightOccurrencesOfString:(NSString *)query
-                                               fromPosition:(NSInteger)fromPosition
-                                                  byteLimit:(NSInteger)byteLimit
-                                               maximumCount:(NSInteger)maximumCount
-                                                      error:(NSError **)error {
-    if (query.length == 0)
-        return [[MTEEditorSearchBatch alloc] initWithMatches:@[] nextPosition:0 finished:YES];
-
-    NSData *needle = [query dataUsingEncoding:NSUTF8StringEncoding];
-    const long documentLength = [_scintilla getGeneralProperty:SCI_GETLENGTH];
-    const long start = MIN(documentLength, MAX(0, fromPosition));
-    const long boundary = MIN(documentLength, start + MAX(1, byteLimit));
-    const long targetBoundary = MIN(documentLength, boundary + MAX(0, (long)needle.length - 1));
-    const long countLimit = MAX(1, maximumCount);
-
-    [_scintilla setGeneralProperty:SCI_SETSTATUS value:SC_STATUS_OK];
-    [_scintilla setGeneralProperty:SCI_SETSEARCHFLAGS value:SCFIND_MATCHCASE];
-    [_scintilla setGeneralProperty:SCI_SETINDICATORCURRENT value:MTESmartHighlightIndicator];
-
-    NSMutableArray<MTEEditorMatch *> *matches = [NSMutableArray array];
-    long cursor = start;
-    BOOL exhaustedRange = YES;
-    while (cursor <= targetBoundary) {
-        [_scintilla setGeneralProperty:SCI_SETTARGETRANGE parameter:cursor value:targetBoundary];
-        const long found = [_scintilla message:SCI_SEARCHINTARGET
-                                        wParam:needle.length
-                                        lParam:reinterpret_cast<sptr_t>(needle.bytes)];
-        if (found < 0)
-            break;
-        const long matchStart = [_scintilla getGeneralProperty:SCI_GETTARGETSTART];
-        const long matchEnd = [_scintilla getGeneralProperty:SCI_GETTARGETEND];
-        if (boundary < documentLength && matchStart >= boundary)
-            break;
-
-        const long matchLength = MAX(0, matchEnd - matchStart);
-        [matches addObject:[[MTEEditorMatch alloc]
-            initWithByteRange:NSMakeRange(matchStart, matchLength)
-                   lineNumber:0
-                     lineText:@""]];
-        [_scintilla setGeneralProperty:SCI_INDICATORFILLRANGE
-                             parameter:matchStart
-                                 value:matchLength];
-
-        if (matchEnd > matchStart) {
-            cursor = matchEnd;
-        } else {
-            const long next = [_scintilla getGeneralProperty:SCI_POSITIONAFTER parameter:matchStart];
-            cursor = next > matchStart ? next : matchStart + 1;
-        }
-        if (matches.count >= countLimit) {
-            exhaustedRange = NO;
-            break;
-        }
-    }
-
-    const long status = [_scintilla getGeneralProperty:SCI_GETSTATUS];
-    if (status != SC_STATUS_OK) {
-        if (error) {
-            *error = [NSError errorWithDomain:MTEEditorErrorDomain
-                                         code:status
-                                     userInfo:@{NSLocalizedDescriptionKey: @"Scintilla 智能高亮失败。"}];
-        }
-        return [[MTEEditorSearchBatch alloc] initWithMatches:@[] nextPosition:start finished:YES];
-    }
-
-    const long nextPosition = exhaustedRange ? boundary : cursor;
-    return [[MTEEditorSearchBatch alloc] initWithMatches:matches
-                                           nextPosition:nextPosition
-                                               finished:nextPosition >= documentLength];
-}
 
 - (NSInteger)replaceAllOccurrencesOfString:(NSString *)query
                                 withString:(NSString *)replacement
@@ -715,9 +781,82 @@ static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
 }
 
 - (void)clearSmartHighlights {
+    [self clearFullSmartHighlights];
+    [_scintilla setGeneralProperty:SCI_SETINDICATORCURRENT value:MTEVisibleSmartHighlightIndicator];
+    // Edits shift Scintilla's indicators before the stored viewport ranges are invalidated.
+    [_scintilla setGeneralProperty:SCI_INDICATORCLEARRANGE parameter:0 value:self.documentLength];
+    _visibleSmartRanges.clear();
+}
+
+- (void)clearFullSmartHighlights {
     const long length = [_scintilla getGeneralProperty:SCI_GETLENGTH];
     [_scintilla setGeneralProperty:SCI_SETINDICATORCURRENT value:MTESmartHighlightIndicator];
     [_scintilla setGeneralProperty:SCI_INDICATORCLEARRANGE parameter:0 value:length];
+}
+
+- (std::vector<NSRange>)visibleSmartRangesFromValues:(NSArray<NSValue *> *)values {
+    const NSUInteger documentLength = self.documentLength;
+    std::vector<NSRange> result;
+    for (NSValue *value in values) {
+        const NSRange range = value.rangeValue;
+        if (range.location >= documentLength || range.length == 0)
+            continue;
+        const NSUInteger end = range.location + MIN(range.length, documentLength - range.location);
+        NSUInteger position = range.location;
+        while (position < end) {
+            const long full = [_scintilla getGeneralProperty:SCI_INDICATORVALUEAT
+                                                  parameter:MTESmartHighlightIndicator extra:position];
+            const long runEnd = [_scintilla getGeneralProperty:SCI_INDICATOREND
+                                                    parameter:MTESmartHighlightIndicator extra:position];
+            const NSUInteger next = runEnd > static_cast<long>(position) ? MIN(end, static_cast<NSUInteger>(runEnd)) : end;
+            if (full == 0)
+                result.push_back(NSMakeRange(position, next - position));
+            position = next;
+        }
+    }
+    return MTEMergedRanges(std::move(result));
+}
+
+- (void)setVisibleSmartByteRanges:(NSArray<NSValue *> *)ranges {
+    auto visible = [self visibleSmartRangesFromValues:ranges];
+    const auto removed = MTERangeDifference(_visibleSmartRanges, visible);
+    const auto added = MTERangeDifference(visible, _visibleSmartRanges);
+    [_scintilla setGeneralProperty:SCI_SETINDICATORCURRENT value:MTEVisibleSmartHighlightIndicator];
+    for (NSRange range : removed)
+        [_scintilla setGeneralProperty:SCI_INDICATORCLEARRANGE parameter:range.location value:range.length];
+    for (NSRange range : added)
+        [_scintilla setGeneralProperty:SCI_INDICATORFILLRANGE parameter:range.location value:range.length];
+    _visibleSmartRanges = std::move(visible);
+}
+
+- (void)addVisibleSmartByteRanges:(NSArray<NSValue *> *)ranges {
+    if (ranges.count == 0)
+        return;
+    auto visible = [self visibleSmartRangesFromValues:ranges];
+    [_scintilla setGeneralProperty:SCI_SETINDICATORCURRENT value:MTEVisibleSmartHighlightIndicator];
+    for (NSRange range : visible)
+        [_scintilla setGeneralProperty:SCI_INDICATORFILLRANGE parameter:range.location value:range.length];
+    _visibleSmartRanges.insert(_visibleSmartRanges.end(), visible.begin(), visible.end());
+    _visibleSmartRanges = MTEMergedRanges(std::move(_visibleSmartRanges));
+}
+
+- (void)addFullSmartByteRanges:(NSArray<NSValue *> *)ranges {
+    const NSUInteger documentLength = self.documentLength;
+    std::vector<NSRange> added;
+    for (NSValue *value in ranges) {
+        const NSRange range = value.rangeValue;
+        if (range.location < documentLength && range.length > 0)
+            added.push_back(NSMakeRange(range.location, MIN(range.length, documentLength - range.location)));
+    }
+    added = MTEMergedRanges(std::move(added));
+    // A byte is painted by one smart-highlight layer, never both translucent layers.
+    [_scintilla setGeneralProperty:SCI_SETINDICATORCURRENT value:MTEVisibleSmartHighlightIndicator];
+    for (NSRange range : added)
+        [_scintilla setGeneralProperty:SCI_INDICATORCLEARRANGE parameter:range.location value:range.length];
+    _visibleSmartRanges = MTERangeDifference(_visibleSmartRanges, added);
+    [_scintilla setGeneralProperty:SCI_SETINDICATORCURRENT value:MTESmartHighlightIndicator];
+    for (NSRange range : added)
+        [_scintilla setGeneralProperty:SCI_INDICATORFILLRANGE parameter:range.location value:range.length];
 }
 
 - (void)addMarkedByteRanges:(NSArray<NSValue *> *)ranges {
@@ -762,7 +901,10 @@ static NSArray<NSURL *> *MTEFileURLs(id<NSDraggingInfo> sender) {
         case SCN_UPDATEUI:
             if ((notification->updated & SC_UPDATE_V_SCROLL) != 0)
                 [self updateLineNumberMarginWidth];
-            [self.delegate editorViewSelectionDidChange:self];
+            if ((notification->updated & SC_UPDATE_SELECTION) != 0)
+                [self.delegate editorViewSelectionDidChange:self];
+            if ((notification->updated & (SC_UPDATE_V_SCROLL | SC_UPDATE_H_SCROLL)) != 0)
+                [self.delegate editorViewViewportDidChange:self];
             break;
         default:
             break;
